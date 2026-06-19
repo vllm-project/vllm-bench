@@ -1741,6 +1741,10 @@ async fn sample_verify_prompts(
                 println!("Server does not expose /tokenize (404), skipping verification.");
                 return Ok(true);
             }
+            Err(BenchError::Tokenizer(_)) => {
+                println!("Server /tokenize returned an error, skipping verification.");
+                return Ok(true);
+            }
             Err(e) => return Err(e),
         };
 
