@@ -50,6 +50,16 @@ vllm-bench --backend vllm --base-url http://127.0.0.1:8000 \
 curl -fsSL https://github.com/vllm-project/vllm-bench/releases/latest/download/vllm-bench-$(uname -m)-linux-musl -o vllm-bench && chmod +x vllm-bench
 ```
 
+### With Cargo
+
+Install straight from the repository (builds from source; requires [Rust](https://rustup.rs/) stable and a C compiler for the native tokenizer dependency):
+
+```bash
+cargo install --git https://github.com/vllm-project/vllm-bench vllm-bench
+```
+
+The trailing `vllm-bench` selects the package — the repo also ships a `mock-llm-server` binary, so omitting it fails with `multiple packages with binaries found`. The binary is installed to `~/.cargo/bin/`.
+
 ### Build from source
 
 Requires [Rust](https://rustup.rs/) (stable).
