@@ -229,6 +229,19 @@ pub struct Cli {
     #[arg(long, default_value_t = 1.0)]
     pub random_range_ratio: f64,
 
+    /// Bimodal prefix-cache (random dataset): fraction of prompts that are "warm"
+    /// and reuse a shared cached prefix. 0.0 = off (default). E.g. 0.8 = 80% warm
+    /// (prefix-cache hit), 20% cold (full prefill). Requires --random-cache-ratio > 0
+    /// and --prompt-token-ids. In this mode --random-input-len is the TOTAL length.
+    #[arg(long, default_value_t = 0.0)]
+    pub random_cache_hit_fraction: f64,
+
+    /// Bimodal prefix-cache (random dataset): fraction of each WARM prompt's length
+    /// that is the shared cached prefix. 0.0 = off (default). E.g. 0.95 = 95% cached,
+    /// 5% unique suffix. Used with --random-cache-hit-fraction.
+    #[arg(long, default_value_t = 0.0)]
+    pub random_cache_ratio: f64,
+
     /// Send prompt as token ID arrays instead of text strings.
     /// By default, prompts are decoded to text for maximum
     /// compatibility. Enable this for pure vLLM deployments to skip server-side

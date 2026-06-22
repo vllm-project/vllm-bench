@@ -437,6 +437,8 @@ pub async fn run_benchmark(config: &BenchConfig) -> Result<serde_json::Value> {
                 config.random_output_len,
                 config.random_prefix_len,
                 config.random_range_ratio,
+                config.random_cache_hit_fraction,
+                config.random_cache_ratio,
                 config.seed,
                 &config.request_id_prefix,
                 config.prompt_token_ids,
