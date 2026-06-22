@@ -23,6 +23,8 @@ pub fn generate_random_dataset(
     output_len: usize,
     prefix_len: usize,
     range_ratio: f64,
+    cache_hit_fraction: f64,
+    cache_ratio: f64,
     seed: u64,
     request_id_prefix: &str,
     use_token_ids: bool,
@@ -49,18 +51,49 @@ pub fn generate_random_dataset(
     let output_low = ((output_len as f64) * range_ratio).floor().max(1.0) as usize;
     let output_high = output_len;
 
-    // Validate
-    let min_total = prefix_len + input_low;
-    if min_total < 1 {
-        return Err(BenchError::Config(format!(
-            "--random-input-len too small: with {num_special} special tokens and \
-             range_ratio={range_ratio}, minimum total input is {min_total}"
-        )));
+    // Bimodal prefix-cache mode: a fraction of prompts (warm) reuse a shared cached
+    // prefix covering `cache_ratio` of their length; the rest (cold) are fully unique.
+    // Models e.g. "80% of prompts have 95% of input cached" with
+    // --random-cache-hit-fraction 0.8 --random-cache-ratio 0.95. In this mode
+    // --random-input-len is the TOTAL prompt length L (the cached prefix is part of L),
+    // and --random-prefix-len is ignored.
+    let bimodal = cache_hit_fraction > 0.0 && cache_ratio > 0.0;
+    if bimodal {
+        if !use_token_ids {
+            return Err(BenchError::Config(
+                "bimodal prefix-cache (--random-cache-hit-fraction) requires --prompt-token-ids \
+                 so warm prompts send identical token IDs and actually hit the prefix cache"
+                    .into(),
+            ));
+        }
+        if cache_hit_fraction > 1.0 || cache_ratio > 1.0 {
+            return Err(BenchError::Config(
+                "--random-cache-hit-fraction and --random-cache-ratio must be in [0, 1]".into(),
+            ));
+        }
     }
 
-    // Generate prefix once (sequential, only happens once)
-    let prefix_token_ids = if prefix_len > 0 {
-        generate_prefix(tokenizer, &allowed_tokens, prefix_len, seed)?
+    // Length of the shared cached base prefix.
+    let base_len = if bimodal {
+        ((input_high as f64) * cache_ratio).ceil() as usize
+    } else {
+        prefix_len
+    };
+
+    // Validate (non-bimodal keeps the original check)
+    if !bimodal {
+        let min_total = prefix_len + input_low;
+        if min_total < 1 {
+            return Err(BenchError::Config(format!(
+                "--random-input-len too small: with {num_special} special tokens and \
+                 range_ratio={range_ratio}, minimum total input is {min_total}"
+            )));
+        }
+    }
+
+    // Generate the shared base prefix once (sequential, only happens once).
+    let prefix_token_ids = if base_len > 0 {
+        generate_prefix(tokenizer, &allowed_tokens, base_len, seed)?
     } else {
         Vec::new()
     };
@@ -72,28 +105,54 @@ pub fn generate_random_dataset(
     let mut rng = StdRng::seed_from_u64(seed);
 
     struct RequestParams {
-        input_len: usize,
+        cached_len: usize, // tokens taken from the shared base (cache-hittable)
+        suffix_len: usize, // unique tokens appended after the cached prefix
         output_len: usize,
         offset: usize,
     }
 
     let params: Vec<RequestParams> = (0..num_requests)
         .map(|_| {
-            let il = if input_low == input_high {
-                input_low
-            } else {
-                rng.gen_range(input_low..=input_high)
-            };
             let ol = if output_low == output_high {
                 output_low
             } else {
                 rng.gen_range(output_low..=output_high)
             };
             let off = rng.gen_range(0..vocab_size as usize);
-            RequestParams {
-                input_len: il,
-                output_len: ol,
-                offset: off,
+            if bimodal {
+                // Total length L from the input distribution; prefix is part of L.
+                let l = if input_low == input_high {
+                    input_low
+                } else {
+                    rng.gen_range(input_low..=input_high)
+                };
+                let warm = rng.gen::<f64>() < cache_hit_fraction;
+                let cached = if warm {
+                    (((l as f64) * cache_ratio).round() as usize)
+                        .min(base_len)
+                        .min(l)
+                } else {
+                    0
+                };
+                RequestParams {
+                    cached_len: cached,
+                    suffix_len: l - cached,
+                    output_len: ol,
+                    offset: off,
+                }
+            } else {
+                // Original behavior: full shared prefix + variable unique input.
+                let il = if input_low == input_high {
+                    input_low
+                } else {
+                    rng.gen_range(input_low..=input_high)
+                };
+                RequestParams {
+                    cached_len: prefix_len,
+                    suffix_len: il,
+                    output_len: ol,
+                    offset: off,
+                }
             }
         })
         .collect();
@@ -108,16 +167,16 @@ pub fn generate_random_dataset(
         .enumerate()
         .map(|(i, p)| {
             let at_len = allowed_ref.len();
-            let mut seq = Vec::with_capacity(prefix_ref.len() + p.input_len);
-            seq.extend_from_slice(prefix_ref);
-            for j in 0..p.input_len {
+            let mut seq = Vec::with_capacity(p.cached_len + p.suffix_len);
+            seq.extend_from_slice(&prefix_ref[..p.cached_len]);
+            for j in 0..p.suffix_len {
                 seq.push(allowed_ref[(p.offset + i + j) % at_len]);
             }
             seq
         })
         .collect();
 
-    let target_lens: Vec<usize> = params.iter().map(|p| prefix_len + p.input_len).collect();
+    let target_lens: Vec<usize> = params.iter().map(|p| p.cached_len + p.suffix_len).collect();
 
     if use_token_ids {
         // Fast path: store token IDs directly. The completions backend sends
@@ -253,6 +312,8 @@ mod tests {
             32,  // output_len
             0,   // prefix_len
             1.0, // range_ratio (1.0 = fixed length)
+            0.0, // cache_hit_fraction (0 = bimodal off)
+            0.0, // cache_ratio
             42,  // seed
             "test-", true, // use_token_ids
         )
@@ -277,6 +338,8 @@ mod tests {
             32,  // output_len
             0,   // prefix_len
             1.0, // range_ratio (1.0 = fixed length)
+            0.0, // cache_hit_fraction (0 = bimodal off)
+            0.0, // cache_ratio
             42,  // seed
             "test-", false, // use_token_ids = false → text prompts
         )
@@ -305,6 +368,8 @@ mod tests {
             64,
             0,
             1.0,
+            0.0,
+            0.0,
             123,
             "len-test-",
             true,
@@ -349,6 +414,8 @@ mod tests {
             32,
             0,
             1.0,
+            0.0,
+            0.0,
             42,
             "tiktoken-test-",
             true,
