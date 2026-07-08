@@ -269,6 +269,13 @@ pub struct Cli {
     #[arg(long, default_value = "{(256,256,1): 0.5, (720,1280,1): 0.5}")]
     pub random_mm_bucket_config: String,
 
+    /// Enable multimodal chat transformation for datasets that support it.
+    /// The dataset pre-builds the OpenAI chat `messages` array (text part +
+    /// multimodal items) at generation time, and the request sends it verbatim.
+    /// Mirrors Python's --enable-multimodal-chat. Currently applies to random-mm.
+    #[arg(long, default_value_t = false)]
+    pub enable_multimodal_chat: bool,
+
     /// Number of prompts to generate.
     #[arg(long, default_value_t = 1000)]
     pub num_prompts: usize,

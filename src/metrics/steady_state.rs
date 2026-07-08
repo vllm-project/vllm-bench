@@ -454,6 +454,7 @@ mod tests {
             request_id: None,
             prompt_token_ids: None,
             multi_modal_content: None,
+            chat_messages_json: None,
         }
     }
 

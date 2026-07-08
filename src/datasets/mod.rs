@@ -37,6 +37,15 @@ pub struct SampleRequest {
     ///
     /// Double-`Arc` for zero-cost sharing: outer Arc for the slice, inner Arc for each fragment.
     pub multi_modal_content: Option<Arc<[Arc<str>]>>,
+    /// Pre-serialized OpenAI chat `messages` array as a complete JSON string,
+    /// e.g. `[{"role":"user","content":[{"type":"text","text":"..."},{"type":"image_url",...}]}]`.
+    ///
+    /// Set by datasets when `--enable-multimodal-chat` is on (mirrors Python's
+    /// `apply_multimodal_chat_transformation`: the dataset builds the chat messages
+    /// and the backend sends them verbatim). When set, `multi_modal_content` is None
+    /// and the mm items are embedded here instead. `prompt` still holds the text part
+    /// for token accounting and /tokenize verification.
+    pub chat_messages_json: Option<Arc<str>>,
 }
 
 /// A single turn in a multi-turn conversation.

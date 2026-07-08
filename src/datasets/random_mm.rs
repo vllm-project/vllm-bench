@@ -307,6 +307,7 @@ pub fn generate_random_mm_dataset(
     num_mm_items_range_ratio: f64,
     limit: &MmLimitPerPrompt,
     buckets: &[(MmBucketKey, f64)],
+    enable_multimodal_chat: bool,
 ) -> Result<Vec<SampleRequest>> {
     if !(range_ratio > 0.0 && range_ratio <= 1.0) {
         return Err(BenchError::Config(
@@ -451,10 +452,21 @@ pub fn generate_random_mm_dataset(
                 })
                 .collect();
 
-            let mm_content = if mm_items.is_empty() {
+            let mm_content: Option<Arc<[Arc<str>]>> = if mm_items.is_empty() {
                 None
             } else {
                 Some(Arc::from(mm_items))
+            };
+
+            // --enable-multimodal-chat: pre-build the full chat `messages` array
+            // (text part + mm items) at dataset time, mirroring Python's
+            // apply_multimodal_chat_transformation. mm content moves inside the
+            // messages string; the backend splices it verbatim.
+            let (mm_content, chat_messages_json) = if enable_multimodal_chat {
+                let msgs = build_chat_messages_json(&prompt, mm_content.as_deref());
+                (None, Some(Arc::from(msgs.as_str())))
+            } else {
+                (mm_content, None)
             };
 
             SampleRequest {
@@ -464,11 +476,34 @@ pub fn generate_random_mm_dataset(
                 request_id: Some(format!("{rid_prefix}{i}")),
                 prompt_token_ids: None,
                 multi_modal_content: mm_content,
+                chat_messages_json,
             }
         })
         .collect();
 
     Ok(result)
+}
+
+/// Pre-serialize the OpenAI chat `messages` array for --enable-multimodal-chat.
+///
+/// Produces `[{"role":"user","content":[{"type":"text","text":"..."},<frag>,...]}]`
+/// by concatenating the JSON-escaped prompt with the pre-serialized mm fragments,
+/// so the ~200KB+ base64 image data is never parsed or re-serialized.
+pub(crate) fn build_chat_messages_json(prompt: &str, mm_items: Option<&[Arc<str>]>) -> String {
+    let mm_total: usize = mm_items
+        .map(|items| items.iter().map(|f| f.len() + 1).sum())
+        .unwrap_or(0);
+    let mut msgs = String::with_capacity(64 + prompt.len() * 2 + mm_total);
+    msgs.push_str(r#"[{"role":"user","content":[{"type":"text","text":"#);
+    // serde_json::to_string on &str produces a JSON-escaped quoted string
+    msgs.push_str(&serde_json::to_string(prompt).unwrap());
+    msgs.push('}');
+    for fragment in mm_items.unwrap_or(&[]) {
+        msgs.push(',');
+        msgs.push_str(fragment);
+    }
+    msgs.push_str("]}]");
+    msgs
 }
 
 fn generate_prefix(
@@ -526,6 +561,30 @@ mod tests {
         let buckets = parse_bucket_config(input).unwrap();
         assert_eq!(buckets.len(), 3);
         assert_eq!(buckets[2].0.num_frames, 16);
+    }
+
+    #[test]
+    fn test_build_chat_messages_json_valid_and_ordered() {
+        let frag: Arc<str> =
+            Arc::from(r#"{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,AAAA"}}"#);
+        let msgs = build_chat_messages_json("hi \"there\"\nline2", Some(&[frag]));
+        let v: serde_json::Value = serde_json::from_str(&msgs).expect("must be valid JSON");
+        assert_eq!(v.as_array().unwrap().len(), 1);
+        assert_eq!(v[0]["role"], "user");
+        let content = v[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "hi \"there\"\nline2");
+        assert_eq!(content[1]["type"], "image_url");
+    }
+
+    #[test]
+    fn test_build_chat_messages_json_text_only() {
+        let msgs = build_chat_messages_json("plain", None);
+        let v: serde_json::Value = serde_json::from_str(&msgs).unwrap();
+        let content = v[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["text"], "plain");
     }
 
     #[test]

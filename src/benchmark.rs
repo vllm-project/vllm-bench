@@ -461,6 +461,7 @@ pub async fn run_benchmark(config: &BenchConfig) -> Result<serde_json::Value> {
                 config.random_mm_num_mm_items_range_ratio,
                 &config.random_mm_limit,
                 &config.random_mm_buckets,
+                config.enable_multimodal_chat,
             )?
         }
         DatasetName::ShareGpt => {
@@ -616,6 +617,7 @@ pub async fn run_benchmark(config: &BenchConfig) -> Result<serde_json::Value> {
         messages: None,
         prompt_token_ids: first.prompt_token_ids.clone(),
         multi_modal_content: first.multi_modal_content.clone(),
+        chat_messages_json: first.chat_messages_json.clone(),
     };
 
     // Ready check
@@ -876,6 +878,7 @@ pub async fn run_benchmark(config: &BenchConfig) -> Result<serde_json::Value> {
         let request_id = request.request_id.clone();
         let prompt_token_ids = request.prompt_token_ids.clone();
         let multi_modal_content = request.multi_modal_content.clone();
+        let chat_messages_json = request.chat_messages_json.clone();
 
         let delay_dur = std::time::Duration::from_secs_f64(*delay);
         let bench_start = benchmark_start;
@@ -917,6 +920,7 @@ pub async fn run_benchmark(config: &BenchConfig) -> Result<serde_json::Value> {
                     messages: None,
                     prompt_token_ids,
                     multi_modal_content,
+                    chat_messages_json,
                 };
 
                 // Send request, retry on connection errors
@@ -1147,6 +1151,7 @@ mod max_model_len_tests {
             request_id: None,
             prompt_token_ids: None,
             multi_modal_content: None,
+            chat_messages_json: None,
         }
     }
 

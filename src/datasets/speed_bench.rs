@@ -263,6 +263,7 @@ pub fn load_speed_bench_dataset(
             request_id: Some(format!("{request_id_prefix}{idx}")),
             prompt_token_ids: None,
             multi_modal_content: None,
+            chat_messages_json: None,
         });
         idx += 1;
     }
