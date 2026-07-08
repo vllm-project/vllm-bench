@@ -192,6 +192,7 @@ pub fn generate_random_dataset(
                 request_id: Some(format!("{rid_prefix}{i}")),
                 prompt_token_ids: Some(Arc::from(tokens)),
                 multi_modal_content: None,
+                chat_messages_json: None,
             })
             .collect();
         Ok(result)
@@ -216,6 +217,7 @@ pub fn generate_random_dataset(
                     request_id: Some(format!("{rid_prefix}{i}")),
                     prompt_token_ids: None,
                     multi_modal_content: None,
+                    chat_messages_json: None,
                 })
             })
             .collect::<Result<Vec<_>>>()?;

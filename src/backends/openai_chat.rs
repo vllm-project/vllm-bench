@@ -36,16 +36,17 @@ impl OpenAIChatBackend {
         let mut first_token_received = false;
 
         // Build request: use zero-copy raw JSON for multimodal, serde_json for text-only
-        let mut request = if input.multi_modal_content.is_some() {
-            let payload_bytes = build_mm_payload(input);
-            client
-                .post(&input.api_url)
-                .header("content-type", "application/json")
-                .body(payload_bytes)
-        } else {
-            let payload = build_text_payload(input);
-            client.post(&input.api_url).json(&payload)
-        };
+        let mut request =
+            if input.multi_modal_content.is_some() || input.chat_messages_json.is_some() {
+                let payload_bytes = build_mm_payload(input);
+                client
+                    .post(&input.api_url)
+                    .header("content-type", "application/json")
+                    .body(payload_bytes)
+            } else {
+                let payload = build_text_payload(input);
+                client.post(&input.api_url).json(&payload)
+            };
         for (k, v) in &headers_map {
             request = request.header(k, v);
         }
@@ -207,10 +208,14 @@ fn build_text_payload(input: &RequestFuncInput) -> serde_json::Value {
 /// the serde_json::Value approach.
 fn build_mm_payload(input: &RequestFuncInput) -> Vec<u8> {
     let model = input.model_name.as_deref().unwrap_or(&input.model);
-    let mm = input.multi_modal_content.as_ref().unwrap();
 
     // Estimate total size: JSON overhead (~300 bytes) + prompt + mm fragments
-    let mm_total: usize = mm.iter().map(|f| f.len() + 1).sum();
+    let mm_total: usize = input
+        .multi_modal_content
+        .as_ref()
+        .map(|mm| mm.iter().map(|f| f.len() + 1).sum())
+        .unwrap_or(0)
+        + input.chat_messages_json.as_ref().map_or(0, |m| m.len());
     let estimated = 512 + input.prompt.len() * 2 + mm_total;
     let mut json = String::with_capacity(estimated);
 
@@ -219,20 +224,29 @@ fn build_mm_payload(input: &RequestFuncInput) -> Vec<u8> {
     // serde_json::to_string on &str produces a JSON-escaped quoted string
     json.push_str(&serde_json::to_string(model).unwrap());
 
-    // ,"messages": [{"role":"user","content":[ <text part>
-    json.push_str(r#","messages":[{"role":"user","content":[{"type":"text","text":""#);
-    // JSON-escape the prompt text (handles \n, \t, unicode, quotes)
-    push_json_escaped_str(&mut json, &input.prompt);
-    json.push_str(r#""}"#);
+    json.push_str(r#","messages":"#);
+    if let Some(ref msgs) = input.chat_messages_json {
+        // --enable-multimodal-chat: the dataset pre-built the full messages
+        // array (text + mm parts); splice it verbatim.
+        json.push_str(msgs);
+    } else {
+        let mm = input.multi_modal_content.as_ref().unwrap();
 
-    // ,<mm fragment 1>,<mm fragment 2>,...
-    for fragment in mm.iter() {
-        json.push(',');
-        json.push_str(fragment);
+        // [{"role":"user","content":[ <text part>
+        json.push_str(r#"[{"role":"user","content":[{"type":"text","text":""#);
+        // JSON-escape the prompt text (handles \n, \t, unicode, quotes)
+        push_json_escaped_str(&mut json, &input.prompt);
+        json.push_str(r#""}"#);
+
+        // ,<mm fragment 1>,<mm fragment 2>,...
+        for fragment in mm.iter() {
+            json.push(',');
+            json.push_str(fragment);
+        }
+
+        // Close content, message, messages
+        json.push_str(r#"]}]"#);
     }
-
-    // Close content, message, messages
-    json.push_str(r#"]}]"#);
 
     // ,"max_completion_tokens": N, "stream": true, ...
     json.push_str(r##","max_completion_tokens":"##);
@@ -289,5 +303,74 @@ fn push_json_escaped_str(buf: &mut String, s: &str) {
             }
             c => buf.push(c),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    fn mm_input() -> RequestFuncInput {
+        let frag: Arc<str> =
+            Arc::from(r#"{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,AAAA"}}"#);
+        RequestFuncInput {
+            prompt: Arc::from("hello \"world\"\nline2"),
+            model: "test-model".to_string(),
+            output_len: 128,
+            multi_modal_content: Some(Arc::from(vec![frag])),
+            ..Default::default()
+        }
+    }
+
+    /// Regression test: the assembled multimodal payload must be valid JSON
+    /// (the text part once shipped without its opening quote — a raw-string
+    /// delimiter eating the trailing `"` in `"text":"`).
+    #[test]
+    fn test_build_mm_payload_is_valid_json() {
+        let payload = build_mm_payload(&mm_input());
+        let v: serde_json::Value =
+            serde_json::from_slice(&payload).expect("mm payload must be valid JSON");
+        assert_eq!(v["model"], "test-model");
+        assert_eq!(v["messages"][0]["role"], "user");
+        let content = v["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "hello \"world\"\nline2");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(v["max_completion_tokens"], 128);
+        assert_eq!(v["stream"], true);
+        assert_eq!(v["stream_options"]["include_usage"], true);
+    }
+
+    /// --enable-multimodal-chat (dataset pre-built messages) must produce a
+    /// payload semantically identical to the fragment-assembly path.
+    #[test]
+    fn test_chat_messages_json_path_equivalent_to_fragment_path() {
+        let base = mm_input();
+        let fragment_payload = build_mm_payload(&base);
+
+        let mut chat = base.clone();
+        let mm = chat.multi_modal_content.take().unwrap();
+        let msgs = crate::datasets::random_mm::build_chat_messages_json(&chat.prompt, Some(&mm));
+        chat.chat_messages_json = Some(Arc::from(msgs.as_str()));
+        let chat_payload = build_mm_payload(&chat);
+
+        let a: serde_json::Value = serde_json::from_slice(&fragment_payload).unwrap();
+        let b: serde_json::Value = serde_json::from_slice(&chat_payload).unwrap();
+        assert_eq!(a, b);
+    }
+
+    /// ignore_eos and extra_body must survive the raw-splice path.
+    #[test]
+    fn test_mm_payload_tail_fields() {
+        let mut input = mm_input();
+        input.ignore_eos = true;
+        input.extra_body = Some(serde_json::json!({"temperature": 0.5, "stream": false}));
+        let v: serde_json::Value = serde_json::from_slice(&build_mm_payload(&input)).unwrap();
+        assert_eq!(v["ignore_eos"], true);
+        assert_eq!(v["temperature"], 0.5);
+        // keys already set above must not be overridden by extra_body
+        assert_eq!(v["stream"], true);
     }
 }

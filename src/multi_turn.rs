@@ -249,6 +249,7 @@ pub async fn run_multi_turn_benchmark(config: &BenchConfig) -> Result<serde_json
             messages: None,
             prompt_token_ids: None,
             multi_modal_content: None,
+            chat_messages_json: None,
         };
 
         println!("Starting initial single prompt test run...");
@@ -669,6 +670,7 @@ async fn run_conversation(
             messages: Some(serde_json::json!(messages)),
             prompt_token_ids: None,
             multi_modal_content: None,
+            chat_messages_json: None,
         };
 
         // Acquire semaphore permit before sending the request.

@@ -128,6 +128,7 @@ pub fn load_sonnet_dataset(
                 request_id: Some(format!("{request_id_prefix}{ind}")),
                 prompt_token_ids: None,
                 multi_modal_content: None,
+                chat_messages_json: None,
             });
             ind += 1;
         }

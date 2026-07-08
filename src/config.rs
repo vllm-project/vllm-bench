@@ -118,6 +118,9 @@ pub struct BenchConfig {
     pub random_mm_num_mm_items_range_ratio: f64,
     pub random_mm_limit: MmLimitPerPrompt,
     pub random_mm_buckets: Vec<(MmBucketKey, f64)>,
+    /// Datasets that support it pre-build the chat `messages` array
+    /// (text + multimodal parts) instead of prompt + separate mm content.
+    pub enable_multimodal_chat: bool,
     /// LoRA adapter names. None = no LoRA routing (use --model directly).
     /// Stored as Arc<str> so per-request override is a cheap clone.
     pub lora_modules: Option<Vec<Arc<str>>>,
@@ -556,6 +559,7 @@ impl BenchConfig {
             random_mm_num_mm_items_range_ratio: cli.random_mm_num_mm_items_range_ratio,
             random_mm_limit,
             random_mm_buckets,
+            enable_multimodal_chat: cli.enable_multimodal_chat,
             lora_modules,
             lora_assignment: cli.lora_assignment,
         })

@@ -79,6 +79,10 @@ pub struct RequestFuncInput {
     /// When set, the chat backend concatenates these directly into the payload bytes,
     /// avoiding any parsing or deep-cloning of base64 image data.
     pub multi_modal_content: Option<Arc<[Arc<str>]>>,
+    /// Complete pre-serialized chat `messages` array (--enable-multimodal-chat).
+    /// When set, the chat backend splices it verbatim into the payload bytes,
+    /// taking precedence over `messages`, `prompt`, and `multi_modal_content`.
+    pub chat_messages_json: Option<Arc<str>>,
 }
 
 /// Output from a single benchmark request including timing metrics.
@@ -130,6 +134,7 @@ impl Default for RequestFuncInput {
             messages: None,
             prompt_token_ids: None,
             multi_modal_content: None,
+            chat_messages_json: None,
         }
     }
 }
