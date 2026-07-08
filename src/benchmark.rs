@@ -580,56 +580,6 @@ pub async fn run_benchmark(config: &BenchConfig) -> Result<serde_json::Value> {
         ));
     }
 
-    // Verify and fix prompt token lengths against the server's /tokenize endpoint.
-    // Uses a cache: if a previous run with the same model+server already verified OK,
-    // skip entirely. Otherwise sample 10 prompts first — if all match, cache and skip.
-    // If any mismatch, do full verify+fix for all prompts.
-    // Skip verification when prompt_token_ids are set (token counts are exact by construction).
-    let has_token_ids = input_requests
-        .first()
-        .is_some_and(|r| r.prompt_token_ids.is_some());
-    if config.dataset_name == DatasetName::Random && has_token_ids && !config.backend.is_pooling() {
-        println!("Using prompt_token_ids, skipping server-side tokenizer verification.");
-    }
-    if config.dataset_name == DatasetName::Random && !has_token_ids && !config.backend.is_pooling()
-    {
-        let cache_key = tokenizer_verify_cache_key(&config.base_url, &model_id);
-        if is_tokenizer_verified(&cache_key) {
-            println!("Tokenizer verified in previous run (cached), skipping verification.");
-        } else {
-            let sample_ok = sample_verify_prompts(
-                &client,
-                &config.base_url,
-                &model_id,
-                &input_requests,
-                config.random_input_len,
-                &config.extra_headers,
-            )
-            .await?;
-
-            if sample_ok {
-                println!("Sample verification passed, skipping full verification.");
-                mark_tokenizer_verified(&cache_key);
-            } else {
-                println!("Sample verification found mismatch, running full verify+fix...");
-                verify_and_fix_prompt_lengths(
-                    &client,
-                    &config.base_url,
-                    &model_id,
-                    &mut input_requests,
-                    config.random_input_len,
-                    &config.extra_headers,
-                )
-                .await?;
-                println!(
-                    "All {} prompts verified: exact token length match.",
-                    input_requests.len()
-                );
-                mark_tokenizer_verified(&cache_key);
-            }
-        }
-    }
-
     // Dry run: just print stats and exit
     if config.dry_run {
         let total_input_tokens: usize = input_requests.iter().map(|r| r.prompt_len).sum();
@@ -686,6 +636,78 @@ pub async fn run_benchmark(config: &BenchConfig) -> Result<serde_json::Value> {
             )));
         }
         println!("Initial test run completed.");
+    }
+
+    // Verify and fix prompt token lengths against the server's /tokenize endpoint.
+    // Runs after the ready check so a still-starting server isn't mistaken for a
+    // tokenize failure, and after the dry-run exit so dry runs stay offline.
+    // Uses a cache: if a previous run with the same model+server already verified OK,
+    // skip entirely. Otherwise sample 10 prompts first — if all match, cache and skip.
+    // If any mismatch, do full verify+fix for all prompts.
+    // Skip verification when prompt_token_ids are set (token counts are exact by construction).
+    let has_token_ids = input_requests
+        .first()
+        .is_some_and(|r| r.prompt_token_ids.is_some());
+    if config.dataset_name == DatasetName::Random && has_token_ids && !config.backend.is_pooling() {
+        println!("Using prompt_token_ids, skipping server-side tokenizer verification.");
+    }
+    if config.dataset_name == DatasetName::Random && !has_token_ids && !config.backend.is_pooling()
+    {
+        let cache_key = tokenizer_verify_cache_key(&config.base_url, &model_id);
+        if is_tokenizer_verified(&cache_key) {
+            println!("Tokenizer verified in previous run (cached), skipping verification.");
+        } else {
+            let num_special = tokenizer
+                .as_ref()
+                .map(|t| t.num_special_tokens_to_add())
+                .unwrap_or(0);
+            match sample_verify_prompts(
+                &client,
+                &config.base_url,
+                &model_id,
+                &input_requests,
+                num_special,
+                &config.extra_headers,
+            )
+            .await?
+            {
+                SampleVerifyOutcome::Passed => {
+                    println!("Sample verification passed, skipping full verification.");
+                    mark_tokenizer_verified(&cache_key);
+                }
+                SampleVerifyOutcome::Skipped(reason) => {
+                    println!("Server /tokenize unavailable ({reason}), skipping verification.");
+                }
+                SampleVerifyOutcome::Mismatch => {
+                    println!("Sample verification found mismatch, running full verify+fix...");
+                    match verify_and_fix_prompt_lengths(
+                        &client,
+                        &config.base_url,
+                        &model_id,
+                        &mut input_requests,
+                        num_special,
+                        &config.extra_headers,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            println!(
+                                "All {} prompts verified: exact token length match.",
+                                input_requests.len()
+                            );
+                            mark_tokenizer_verified(&cache_key);
+                        }
+                        Err(BenchError::TokenizeUnavailable(reason)) => {
+                            println!(
+                                "Server /tokenize became unavailable during verification \
+                                 ({reason}); proceeding with client-side token counts."
+                            );
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+        }
     }
 
     // Warmup
@@ -1361,15 +1383,16 @@ pub(crate) async fn profile_on_batch_threshold(
 }
 
 /// Verify and fix prompt token lengths against the server's /tokenize + /detokenize.
-/// For each prompt, if the server's token count doesn't match the target, adjust the
-/// token sequence (pad/truncate) and detokenize, repeating until exact match.
+/// For each prompt, if the server's token count doesn't match that prompt's own
+/// target (its generated length plus the special tokens the server adds), adjust
+/// the token sequence (pad/truncate) and detokenize, repeating until exact match.
 /// Runs up to 64 prompts concurrently.
 async fn verify_and_fix_prompt_lengths(
     client: &reqwest::Client,
     base_url: &str,
     model: &str,
     requests: &mut [crate::datasets::SampleRequest],
-    expected_input_len: usize,
+    num_special: usize,
     extra_headers: &Option<std::collections::HashMap<String, String>>,
 ) -> Result<()> {
     let tokenize_url = Arc::new(format!("{base_url}/tokenize"));
@@ -1399,6 +1422,7 @@ async fn verify_and_fix_prompt_lengths(
         let detok_url = detokenize_url.clone();
         let model = model.to_string();
         let prompt = req.prompt.to_string(); // Convert Arc<str> to String for mutation
+        let expected_input_len = req.prompt_len + num_special;
         let api_key = api_key.clone();
         let headers = extra_headers.clone();
         let sem = sem.clone();
@@ -1438,7 +1462,7 @@ async fn verify_and_fix_prompt_lengths(
                         eprintln!(
                             "Prompt {i}: server consistently adds {excess} extra token(s) \
                              (likely BOS), compensating target to {}.",
-                            expected_input_len - excess,
+                            expected_input_len.saturating_sub(excess),
                         );
                     }
                     excess
@@ -1450,6 +1474,11 @@ async fn verify_and_fix_prompt_lengths(
                 let target = expected_input_len.saturating_sub(compensate);
 
                 let mut adjusted = tokens;
+                if adjusted.is_empty() {
+                    return Err(BenchError::Tokenizer(format!(
+                        "Prompt {i}: server returned no tokens, cannot fix prompt length"
+                    )));
+                }
                 if adjusted.len() < target {
                     let pad_needed = target - adjusted.len();
                     let original_len = adjusted.len();
@@ -1483,7 +1512,8 @@ async fn verify_and_fix_prompt_lengths(
         };
         let (i, prompt) = result?;
         requests[i].prompt = Arc::from(prompt);
-        requests[i].prompt_len = expected_input_len;
+        // Server-side count the fix loop converged on for this prompt.
+        requests[i].prompt_len += num_special;
     }
 
     pb.finish_and_clear();
@@ -1546,9 +1576,14 @@ async fn server_tokenize(
             continue;
         }
 
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            // Server doesn't expose /tokenize (e.g. Dynamo) — caller should skip verification
-            return Err(BenchError::Tokenizer("NOT_FOUND".to_string()));
+        if resp.status().is_client_error() {
+            // Server doesn't expose /tokenize (404, e.g. Dynamo) or a gateway
+            // rejects it with another 4xx (LLM-d/EPP returns 400) — caller
+            // should skip verification. 5xx and connection errors stay fatal.
+            return Err(BenchError::TokenizeUnavailable(format!(
+                "HTTP {}",
+                resp.status()
+            )));
         }
 
         if !resp.status().is_success() {
@@ -1636,6 +1671,13 @@ async fn server_detokenize(
             continue;
         }
 
+        if resp.status().is_client_error() {
+            return Err(BenchError::TokenizeUnavailable(format!(
+                "HTTP {}",
+                resp.status()
+            )));
+        }
+
         if !resp.status().is_success() {
             return Err(BenchError::Tokenizer(format!(
                 "Server /detokenize returned HTTP {} for prompt {prompt_idx}",
@@ -1710,16 +1752,30 @@ fn mark_tokenizer_verified(cache_key: &str) {
     let _ = std::fs::write(dir.join(cache_key), "");
 }
 
+/// Outcome of sample verification against the server's /tokenize.
+enum SampleVerifyOutcome {
+    /// All sampled prompts matched their expected token counts.
+    Passed,
+    /// At least one sampled prompt did not match; full verify+fix is needed.
+    Mismatch,
+    /// The server cannot tokenize (4xx from /tokenize); verification skipped.
+    /// Unlike Passed, this must NOT be cached as "verified".
+    Skipped(String),
+}
+
 /// Sample-verify a small number of prompts against the server's /tokenize.
-/// Returns true if all sampled prompts match the expected length.
+/// Each prompt is checked against its own generated length (plus the special
+/// tokens the server adds), so variable-length datasets
+/// (--random-range-ratio < 1.0) and shared prefixes (--random-prefix-len)
+/// verify correctly.
 async fn sample_verify_prompts(
     client: &reqwest::Client,
     base_url: &str,
     model: &str,
     requests: &[crate::datasets::SampleRequest],
-    expected_input_len: usize,
+    num_special: usize,
     extra_headers: &Option<std::collections::HashMap<String, String>>,
-) -> Result<bool> {
+) -> Result<SampleVerifyOutcome> {
     let sample_size = 10.min(requests.len());
     let tokenize_url = format!("{base_url}/tokenize");
     let api_key = std::env::var("OPENAI_API_KEY").ok();
@@ -1739,23 +1795,23 @@ async fn sample_verify_prompts(
         .await
         {
             Ok(t) => t,
-            Err(BenchError::Tokenizer(msg)) if msg == "NOT_FOUND" => {
-                println!("Server does not expose /tokenize (404), skipping verification.");
-                return Ok(true);
+            Err(BenchError::TokenizeUnavailable(reason)) => {
+                return Ok(SampleVerifyOutcome::Skipped(reason));
             }
             Err(e) => return Err(e),
         };
 
-        if tokens.len() != expected_input_len {
+        let expected = request.prompt_len + num_special;
+        if tokens.len() != expected {
             println!(
-                "Prompt {i}: expected {expected_input_len} tokens, server returned {}",
+                "Prompt {i}: expected {expected} tokens, server returned {}",
                 tokens.len()
             );
-            return Ok(false);
+            return Ok(SampleVerifyOutcome::Mismatch);
         }
     }
 
-    Ok(true)
+    Ok(SampleVerifyOutcome::Passed)
 }
 
 #[cfg(test)]

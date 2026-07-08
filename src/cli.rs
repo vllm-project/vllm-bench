@@ -223,9 +223,9 @@ pub struct Cli {
     #[arg(long, default_value_t = 0)]
     pub per_turn_input_len: usize,
 
-    /// Random dataset range ratio. Controls minimum length as a fraction of target.
-    /// E.g., 0.8 with --random-input-len 8192 means ISL ranges from 6554 to 8192.
-    /// 0.0 means all prompts are exactly the target length.
+    /// Random dataset range ratio in (0, 1]. Controls minimum length as a fraction
+    /// of target. E.g., 0.8 with --random-input-len 8192 means ISL ranges from
+    /// 6554 to 8192. 1.0 (the default) means all prompts are exactly the target length.
     #[arg(long, default_value_t = 1.0)]
     pub random_range_ratio: f64,
 

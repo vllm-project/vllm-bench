@@ -14,6 +14,13 @@ pub enum BenchError {
     #[error("Tokenizer error: {0}")]
     Tokenizer(String),
 
+    /// The server's /tokenize//detokenize endpoint is not usable (4xx status:
+    /// not exposed, or rejected by a gateway such as LLM-d/EPP that returns
+    /// 400 instead of 404). Callers treat this as "skip verification", unlike
+    /// `Tokenizer` errors which are genuine failures.
+    #[error("tokenize endpoint unavailable: {0}")]
+    TokenizeUnavailable(String),
+
     #[error("Configuration error: {0}")]
     Config(String),
 
