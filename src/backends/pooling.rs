@@ -97,11 +97,14 @@ impl PoolingBackend {
     fn build_payload(&self, input: &RequestFuncInput) -> serde_json::Value {
         let model = input.model_name.as_deref().unwrap_or(&input.model);
 
-        // For "input" field (openai-embeddings, vllm-pooling): prefer prompt_token_ids
+        // For "input" field (openai-embeddings, vllm-pooling): a batched request
+        // (--random-batch-size) sends the text list; otherwise prefer prompt_token_ids
         // when available. The random dataset sets prompt="" and relies on token IDs;
         // the OpenAI embeddings API accepts both text strings and token ID arrays.
         // Note: embeddings-chat uses text in messages; vllm-rerank uses text as query.
-        let input_value = if let Some(ref token_ids) = input.prompt_token_ids {
+        let input_value = if let Some(ref list) = input.prompt_list {
+            serde_json::json!(list.iter().map(|s| s.as_ref()).collect::<Vec<&str>>())
+        } else if let Some(ref token_ids) = input.prompt_token_ids {
             serde_json::json!(token_ids.as_ref())
         } else {
             serde_json::json!(input.prompt.as_ref())
@@ -149,22 +152,39 @@ impl PoolingBackend {
                 })
             }
             BackendKind::VllmRerank => {
-                // Query: use text prompt or decode from token IDs.
-                // If prompt is empty (random dataset), fail fast rather than sending empty query.
-                let query = input.prompt.as_ref();
-                if query.is_empty() && input.prompt_token_ids.is_some() {
-                    // Random dataset stores tokens only; rerank needs text query.
-                    // Use a placeholder — users should use sharegpt/hf datasets for rerank.
-                    eprintln!(
-                        "WARNING: vllm-rerank received empty query (random dataset uses token IDs only). \
-                         Use --dataset-name sharegpt or hf for meaningful rerank benchmarks."
-                    );
+                // random-rerank dataset: prompt_list = [query, doc1, doc2, ...]
+                // (mirrors Python async_request_vllm_rerank).
+                if let Some(ref list) = input.prompt_list {
+                    if list.len() < 2 {
+                        eprintln!(
+                            "WARNING: vllm-rerank request has no documents \
+                             (prompt_list needs [query, doc, ...])"
+                        );
+                    }
+                    let query = list.first().map(|s| s.as_ref()).unwrap_or("");
+                    let documents: Vec<&str> = list.iter().skip(1).map(|s| s.as_ref()).collect();
+                    serde_json::json!({
+                        "model": model,
+                        "query": query,
+                        "documents": documents,
+                        "truncate_prompt_tokens": -1,
+                    })
+                } else {
+                    // Legacy path: text prompt as query, documents via --extra-body.
+                    let query = input.prompt.as_ref();
+                    if query.is_empty() && input.prompt_token_ids.is_some() {
+                        eprintln!(
+                            "WARNING: vllm-rerank received empty query (random dataset uses \
+                             token IDs only). Use --dataset-name random-rerank for meaningful \
+                             rerank benchmarks."
+                        );
+                    }
+                    serde_json::json!({
+                        "model": model,
+                        "query": query,
+                        "truncate_prompt_tokens": -1,
+                    })
                 }
-                serde_json::json!({
-                    "model": model,
-                    "query": query,
-                    "truncate_prompt_tokens": -1,
-                })
             }
             _ => unreachable!("PoolingBackend with non-pooling kind"),
         };
@@ -239,5 +259,65 @@ fn push_json_escaped_str(buf: &mut String, s: &str) {
             }
             c => buf.push(c),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    fn list(items: &[&str]) -> Option<Arc<[Arc<str>]>> {
+        Some(items.iter().map(|s| Arc::from(*s)).collect())
+    }
+
+    #[test]
+    fn test_embeddings_payload_batched_input() {
+        let backend = PoolingBackend {
+            kind: BackendKind::OpenaiEmbeddings,
+        };
+        let input = RequestFuncInput {
+            model: "bge".to_string(),
+            prompt_list: list(&["t1", "t2", "t3"]),
+            ..Default::default()
+        };
+        let payload = backend.build_payload(&input);
+        assert_eq!(payload["input"], serde_json::json!(["t1", "t2", "t3"]));
+        assert_eq!(payload["model"], "bge");
+        // truncate_prompt_tokens is vLLM-specific and deliberately omitted for
+        // the plain OpenAI embeddings backend.
+        assert!(payload.get("truncate_prompt_tokens").is_none());
+    }
+
+    #[test]
+    fn test_rerank_payload_query_and_documents() {
+        let backend = PoolingBackend {
+            kind: BackendKind::VllmRerank,
+        };
+        let input = RequestFuncInput {
+            model: "reranker".to_string(),
+            prompt_list: list(&["the query", "doc a", "doc b"]),
+            ..Default::default()
+        };
+        let payload = backend.build_payload(&input);
+        assert_eq!(payload["query"], "the query");
+        assert_eq!(payload["documents"], serde_json::json!(["doc a", "doc b"]));
+        assert_eq!(payload["truncate_prompt_tokens"], -1);
+    }
+
+    #[test]
+    fn test_rerank_payload_legacy_single_prompt() {
+        let backend = PoolingBackend {
+            kind: BackendKind::VllmRerank,
+        };
+        let input = RequestFuncInput {
+            model: "reranker".to_string(),
+            prompt: Arc::from("query text"),
+            ..Default::default()
+        };
+        let payload = backend.build_payload(&input);
+        assert_eq!(payload["query"], "query text");
+        assert!(payload.get("documents").is_none());
     }
 }

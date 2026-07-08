@@ -81,6 +81,12 @@ pub enum DatasetName {
     SpeedBench,
     #[value(name = "hf")]
     Hf,
+    #[value(name = "custom")]
+    Custom,
+    #[value(name = "prefix_repetition", alias = "prefix-repetition")]
+    PrefixRepetition,
+    #[value(name = "random-rerank")]
+    RandomRerank,
 }
 
 /// Ramp-up strategy for request rate.
@@ -223,11 +229,27 @@ pub struct Cli {
     #[arg(long, default_value_t = 0)]
     pub per_turn_input_len: usize,
 
-    /// Random dataset range ratio in (0, 1]. Controls minimum length as a fraction
-    /// of target. E.g., 0.8 with --random-input-len 8192 means ISL ranges from
-    /// 6554 to 8192. 1.0 (the default) means all prompts are exactly the target length.
-    #[arg(long, default_value_t = 1.0)]
-    pub random_range_ratio: f64,
+    /// Range ratio for sampling input/output lengths, matching Python
+    /// `vllm bench serve`: lengths are drawn uniformly from
+    /// [len*(1-r), len*(1+r)]. 0.0 (the default) = exact target lengths.
+    /// Accepts a single float in [0, 1) or a JSON object
+    /// '{"input": r1, "output": r2}' for independent control.
+    /// NOTE: semantics changed — the old Rust-only form sampled [len*r, len]
+    /// with default 1.0; old values like 1.0 are now rejected.
+    #[arg(long, default_value = "0.0")]
+    pub random_range_ratio: String,
+
+    /// Batch multiple generated inputs into one request (embeddings/pooling
+    /// backends only). E.g. 8 sends "input": [t1..t8] per request. Mirrors
+    /// Python --random-batch-size. Default 1 = no batching.
+    #[arg(long, default_value_t = 1)]
+    pub random_batch_size: usize,
+
+    /// random-rerank: the served model is NOT a reranker (embedding-based
+    /// scoring). Changes query/document length accounting to mirror Python
+    /// --no-reranker.
+    #[arg(long, default_value_t = false)]
+    pub no_reranker: bool,
 
     /// Bimodal prefix-cache (random dataset): fraction of prompts that are "warm"
     /// and reuse a shared cached prefix. 0.0 = off (default). E.g. 0.8 = 80% warm
@@ -275,6 +297,36 @@ pub struct Cli {
     /// Mirrors Python's --enable-multimodal-chat. Currently applies to random-mm.
     #[arg(long, default_value_t = false)]
     pub enable_multimodal_chat: bool,
+
+    // --- Custom dataset (JSONL) ---
+    /// Output tokens per request for the custom dataset. Set to -1 to use the
+    /// per-line "output_tokens" field from the JSONL file instead.
+    #[arg(long, default_value_t = 256, allow_negative_numbers = true)]
+    pub custom_output_len: i64,
+
+    /// Skip applying a chat template to custom dataset prompts.
+    /// NOTE: the Rust client never renders chat templates client-side, so this
+    /// is always effectively on; passing it silences the informational notice.
+    #[arg(long, default_value_t = false)]
+    pub skip_chat_template: bool,
+
+    // --- Prefix repetition dataset ---
+    /// Shared-prefix token length for the prefix_repetition dataset.
+    #[arg(long, default_value_t = 256)]
+    pub prefix_repetition_prefix_len: usize,
+
+    /// Per-request random suffix token length for the prefix_repetition dataset.
+    #[arg(long, default_value_t = 256)]
+    pub prefix_repetition_suffix_len: usize,
+
+    /// Number of distinct shared prefixes for the prefix_repetition dataset.
+    /// Requests are split evenly across prefixes (num-prompts / num-prefixes each).
+    #[arg(long, default_value_t = 10)]
+    pub prefix_repetition_num_prefixes: usize,
+
+    /// Output tokens per request for the prefix_repetition dataset.
+    #[arg(long, default_value_t = 128)]
+    pub prefix_repetition_output_len: usize,
 
     /// Number of prompts to generate.
     #[arg(long, default_value_t = 1000)]

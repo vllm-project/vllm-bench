@@ -6,6 +6,7 @@ use std::sync::Arc;
 use rayon::prelude::*;
 
 use super::SampleRequest;
+use crate::config::RangeRatio;
 use crate::error::{BenchError, Result};
 use crate::tokenizer::TokenizerKind;
 
@@ -22,34 +23,38 @@ pub fn generate_random_dataset(
     input_len: usize,
     output_len: usize,
     prefix_len: usize,
-    range_ratio: f64,
+    range_ratio: RangeRatio,
     cache_hit_fraction: f64,
     cache_ratio: f64,
     seed: u64,
     request_id_prefix: &str,
     use_token_ids: bool,
+    batch_size: usize,
 ) -> Result<Vec<SampleRequest>> {
-    if !(range_ratio > 0.0 && range_ratio <= 1.0) {
-        return Err(BenchError::Config(
-            "range_ratio must be in (0, 1]. Use 1.0 for fixed-length prompts.".into(),
-        ));
-    }
-
     let vocab_size = tokenizer.vocab_size();
     let allowed_tokens = tokenizer.get_allowed_tokens();
     if allowed_tokens.is_empty() {
         return Err(BenchError::Tokenizer("No allowed tokens found".into()));
     }
 
+    if batch_size > 1 && use_token_ids {
+        return Err(BenchError::Config(
+            "--random-batch-size > 1 is not supported with --prompt-token-ids".into(),
+        ));
+    }
+
     let num_special = tokenizer.num_special_tokens_to_add();
     let real_input_len = input_len.saturating_sub(num_special);
 
-    // range_ratio=0.8 means minimum is 80% of target, maximum is 100%.
-    // e.g., input_len=8192, range_ratio=0.8 → range [6554, 8192]
-    let input_low = ((real_input_len as f64) * range_ratio).floor() as usize;
-    let input_high = real_input_len;
-    let output_low = ((output_len as f64) * range_ratio).floor().max(1.0) as usize;
-    let output_high = output_len;
+    // Python semantics: sample uniformly from [len*(1-r), len*(1+r)].
+    let (input_low, input_high) = range_ratio.input_bounds(real_input_len);
+    let (output_low, output_high) = range_ratio.output_bounds(output_len);
+    if !range_ratio.is_fixed() {
+        println!(
+            "Sampling input_len from [{input_low}, {input_high}] and \
+             output_len from [{output_low}, {output_high}]"
+        );
+    }
 
     // Bimodal prefix-cache mode: a fraction of prompts (warm) reuse a shared cached
     // prefix covering `cache_ratio` of their length; the rest (cold) are fully unique.
@@ -86,7 +91,8 @@ pub fn generate_random_dataset(
         if min_total < 1 {
             return Err(BenchError::Config(format!(
                 "--random-input-len too small: with {num_special} special tokens and \
-                 range_ratio={range_ratio}, minimum total input is {min_total}"
+                 range_ratio={:?}, minimum total input is {min_total}",
+                range_ratio
             )));
         }
     }
@@ -191,8 +197,7 @@ pub fn generate_random_dataset(
                 expected_output_len: params[i].output_len,
                 request_id: Some(format!("{rid_prefix}{i}")),
                 prompt_token_ids: Some(Arc::from(tokens)),
-                multi_modal_content: None,
-                chat_messages_json: None,
+                ..Default::default()
             })
             .collect();
         Ok(result)
@@ -215,13 +220,11 @@ pub fn generate_random_dataset(
                     prompt_len,
                     expected_output_len: params[i].output_len,
                     request_id: Some(format!("{rid_prefix}{i}")),
-                    prompt_token_ids: None,
-                    multi_modal_content: None,
-                    chat_messages_json: None,
+                    ..Default::default()
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(result)
+        Ok(super::batch_requests(result, batch_size, request_id_prefix))
     }
 }
 
@@ -309,15 +312,21 @@ mod tests {
     fn test_generate_random_dataset_token_ids() {
         let tokenizer = tokenizer::load_tokenizer("gpt2", false, None).unwrap();
         let requests = generate_random_dataset(
-            &tokenizer, 10,  // num_requests
+            &tokenizer,
+            10,  // num_requests
             128, // input_len
             32,  // output_len
             0,   // prefix_len
-            1.0, // range_ratio (1.0 = fixed length)
+            RangeRatio {
+                input: 0.0,
+                output: 0.0,
+            }, // range_ratio (0.0 = fixed length)
             0.0, // cache_hit_fraction (0 = bimodal off)
             0.0, // cache_ratio
             42,  // seed
-            "test-", true, // use_token_ids
+            "test-",
+            true, // use_token_ids
+            1,    // batch_size
         )
         .unwrap();
 
@@ -335,15 +344,21 @@ mod tests {
     fn test_generate_random_dataset_text() {
         let tokenizer = tokenizer::load_tokenizer("gpt2", false, None).unwrap();
         let requests = generate_random_dataset(
-            &tokenizer, 10,  // num_requests
+            &tokenizer,
+            10,  // num_requests
             128, // input_len
             32,  // output_len
             0,   // prefix_len
-            1.0, // range_ratio (1.0 = fixed length)
+            RangeRatio {
+                input: 0.0,
+                output: 0.0,
+            }, // range_ratio (0.0 = fixed length)
             0.0, // cache_hit_fraction (0 = bimodal off)
             0.0, // cache_ratio
             42,  // seed
-            "test-", false, // use_token_ids = false → text prompts
+            "test-",
+            false, // use_token_ids = false → text prompts
+            1,     // batch_size
         )
         .unwrap();
 
@@ -369,12 +384,16 @@ mod tests {
             target_len,
             64,
             0,
-            1.0,
+            RangeRatio {
+                input: 0.0,
+                output: 0.0,
+            },
             0.0,
             0.0,
             123,
             "len-test-",
             true,
+            1,
         )
         .unwrap();
 
@@ -415,12 +434,16 @@ mod tests {
             target_len,
             32,
             0,
-            1.0,
+            RangeRatio {
+                input: 0.0,
+                output: 0.0,
+            },
             0.0,
             0.0,
             42,
             "tiktoken-test-",
             true,
+            1,
         )
         .unwrap();
 

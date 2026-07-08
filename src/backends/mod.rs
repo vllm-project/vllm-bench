@@ -83,6 +83,9 @@ pub struct RequestFuncInput {
     /// When set, the chat backend splices it verbatim into the payload bytes,
     /// taking precedence over `messages`, `prompt`, and `multi_modal_content`.
     pub chat_messages_json: Option<Arc<str>>,
+    /// Multiple text inputs for one request (pooling backends only):
+    /// embeddings batch (`"input": [...]`) or rerank query+documents.
+    pub prompt_list: Option<Arc<[Arc<str>]>>,
 }
 
 /// Output from a single benchmark request including timing metrics.
@@ -135,6 +138,7 @@ impl Default for RequestFuncInput {
             prompt_token_ids: None,
             multi_modal_content: None,
             chat_messages_json: None,
+            prompt_list: None,
         }
     }
 }

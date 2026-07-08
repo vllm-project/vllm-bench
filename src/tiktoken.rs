@@ -133,11 +133,15 @@ impl TiktokenTokenizer {
     /// Decode token IDs to text with lossy UTF-8 handling.
     pub fn decode(&self, ids: &[u32]) -> Result<String> {
         if self.is_builtin {
-            let tokens: Vec<u32> = ids.to_vec();
-            return self
+            // Byte-level decode + lossy UTF-8, matching the file-based path below.
+            // (CoreBPE::decode errors on invalid UTF-8, which random token
+            // sequences routinely produce with byte-level BPE vocabularies.)
+            let bytes: Vec<u8> = self
                 .bpe
-                .decode(tokens)
-                .map_err(|e| BenchError::Tokenizer(format!("Tiktoken decode failed: {e}")));
+                ._decode_native_and_split(ids.to_vec())
+                .flatten()
+                .collect();
+            return Ok(String::from_utf8_lossy(&bytes).into_owned());
         }
         let mut bytes = Vec::new();
         for &id in ids {

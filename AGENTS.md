@@ -44,6 +44,9 @@ cargo test -- --ignored
 - `src/datasets/sonnet.rs` — Sonnet dataset (built-in Shakespeare sonnets via `include_str!("../../sonnet.txt")`; controllable token length + shared prefix; mirrors Python `SonnetDataset`)
 - `src/datasets/speed_bench.rs` — NVIDIA SPEED-Bench loader (HF datasets-server API, 6 configs, 11 categories, local cache)
 - `src/datasets/hf_dataset.rs` — Generic HuggingFace dataset loader (datasets-server API, column auto-detection)
+- `src/datasets/custom.rs` — Custom JSONL dataset (`{"prompt": ..., "output_tokens": ...}` per line; `--custom-output-len -1` uses per-line output_tokens; prompts always sent raw — no client-side chat template)
+- `src/datasets/prefix_repetition.rs` — Prefix repetition dataset (N shared prefixes × fresh random suffixes, standard prefix-cache stress; mirrors Python `PrefixRepetitionRandomDataset`)
+- `src/datasets/random_rerank.rs` — Random rerank dataset (one query + batched documents per request for `vllm-rerank`; `--no-reranker` for embedding-based scoring; mirrors Python `RandomDatasetForReranking`)
 - `src/datasets/multi_turn.rs` — Multi-turn synthetic generator + ShareGPT multi-turn loader (3-tier prefix sharing: global/conversation/unique-suffix; `per_turn_input_len`)
 - `src/metrics/mod.rs` — `BenchmarkMetrics` and `MultiTurnMetrics` structs
 - `src/metrics/calculator.rs` — TTFT/TPOT/ITL/E2EL/throughput stats, goodput SLO checking, peak concurrency, `calculate_multi_turn_metrics`
@@ -65,6 +68,8 @@ cargo test -- --ignored
 - **Pre-serialized mm fragments** (`Arc<str>`) for multimodal: image content stored as JSON strings, zero-copy concatenated into payload — avoids deep-cloning ~200KB+ base64 per request
 - **Steady-state metrics** (default-on in closed-loop): measure throughput/TTFT/TPOT only over the saturated plateau to cut run-to-run variance at high concurrency; `steady_state` is an `Option` in JSON (`#[serde(default)]` for backward compat), null when the scope gate fails or `--no-steady-state`
 - **`--prompt-token-ids`** (random dataset only): send token-ID arrays instead of text to skip server-side tokenization; also skips the token-length verification pass (counts exact by construction)
+- **`--random-range-ratio`** follows Python semantics: lengths sampled uniformly from `[len*(1-r), len*(1+r)]`, default `0.0` = fixed; accepts a float in `[0,1)` or `'{"input": r1, "output": r2}'`. (The pre-2026-07 Rust-only form `[len*r, len]` with default 1.0 is rejected with a migration hint.)
+- **`prompt_list`** (`Arc<[Arc<str>]>` on `SampleRequest`/`RequestFuncInput`): multiple inputs per request for pooling backends — embeddings batches (`--random-batch-size`) send `"input": [...]`, rerank sends `[0]` as query + `[1..]` as documents
 - JSON output schema must match Python `vllm bench serve` exactly
 
 ## Common Issues
@@ -76,26 +81,48 @@ cargo test -- --ignored
 ## Typical Usage
 
 ```bash
-# Embedding benchmark (openai-embeddings)
+# Embedding benchmark (openai-embeddings, 8 inputs batched per request)
 ./target/release/vllm-bench \
   --backend openai-embeddings \
   --base-url http://gb200-10:30000 \
   --model BAAI/bge-large-en-v1.5 \
   --dataset-name random \
   --random-input-len 512 \
+  --random-batch-size 8 \
   --num-prompts 1000 \
   --save-result
 
-# vLLM rerank benchmark
+# vLLM rerank benchmark (one query + 8 documents per request)
 ./target/release/vllm-bench \
   --backend vllm-rerank \
   --base-url http://gb200-10:30000 \
   --model BAAI/bge-reranker-v2-m3 \
-  --dataset-name random \
-  --random-input-len 128 \
+  --dataset-name random-rerank \
+  --random-input-len 512 \
+  --random-batch-size 8 \
   --num-prompts 500 \
-  --extra-body '{"documents": ["document to rerank"]}' \
   --save-result
+
+# Prefix-cache stress (10 shared prefixes, 256+256 tokens)
+./target/release/vllm-bench \
+  --backend vllm \
+  --base-url http://gb200-10:30000 \
+  --model nvidia/Kimi-K2.5-NVFP4 \
+  --dataset-name prefix_repetition \
+  --prefix-repetition-prefix-len 256 \
+  --prefix-repetition-suffix-len 256 \
+  --prefix-repetition-num-prefixes 10 \
+  --num-prompts 1000
+
+# Custom JSONL workload ({"prompt": ..., "output_tokens": ...} per line)
+./target/release/vllm-bench \
+  --backend openai-chat \
+  --base-url http://gb200-10:30000 \
+  --model nvidia/Kimi-K2.5-NVFP4 \
+  --dataset-name custom \
+  --dataset-path workload.jsonl \
+  --custom-output-len -1 \
+  --num-prompts 1000
 
 # Random dataset
 ./target/release/vllm-bench \

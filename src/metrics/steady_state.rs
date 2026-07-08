@@ -452,9 +452,7 @@ mod tests {
             prompt_len,
             expected_output_len: 0,
             request_id: None,
-            prompt_token_ids: None,
-            multi_modal_content: None,
-            chat_messages_json: None,
+            ..Default::default()
         }
     }
 
