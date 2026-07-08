@@ -220,7 +220,7 @@ fn build_mm_payload(input: &RequestFuncInput) -> Vec<u8> {
     json.push_str(&serde_json::to_string(model).unwrap());
 
     // ,"messages": [{"role":"user","content":[ <text part>
-    json.push_str(r#","messages":[{"role":"user","content":[{"type":"text","text":"#);
+    json.push_str(r#","messages":[{"role":"user","content":[{"type":"text","text":""#);
     // JSON-escape the prompt text (handles \n, \t, unicode, quotes)
     push_json_escaped_str(&mut json, &input.prompt);
     json.push_str(r#""}"#);
@@ -235,9 +235,9 @@ fn build_mm_payload(input: &RequestFuncInput) -> Vec<u8> {
     json.push_str(r#"]}]"#);
 
     // ,"max_completion_tokens": N, "stream": true, ...
-    json.push_str(r#","max_completion_tokens":"#);
+    json.push_str(r##","max_completion_tokens":"##);
     json.push_str(&input.output_len.to_string());
-    json.push_str(r#","stream":true,"stream_options":{"include_usage":true}"#);
+    json.push_str(r##","stream":true,"stream_options":{"include_usage":true}"##);
 
     if input.ignore_eos {
         json.push_str(r#","ignore_eos":true"#);
