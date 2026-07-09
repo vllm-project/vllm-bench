@@ -421,6 +421,22 @@ pub async fn run_benchmark(config: &BenchConfig) -> Result<serde_json::Value> {
             config.num_prompts,
             config.dataset_path.as_deref().unwrap_or("unknown"),
         ),
+        DatasetName::Custom => format!(
+            "{} prompts from custom JSONL ({})",
+            config.num_prompts,
+            config.dataset_path.as_deref().unwrap_or("unknown"),
+        ),
+        DatasetName::PrefixRepetition => format!(
+            "{} prefix-repetition prompts ({} prefixes, prefix={}, suffix={})",
+            config.num_prompts,
+            config.prefix_repetition_num_prefixes,
+            config.prefix_repetition_prefix_len,
+            config.prefix_repetition_suffix_len,
+        ),
+        DatasetName::RandomRerank => format!(
+            "{} random rerank requests (batch={}, reranker={})",
+            config.num_prompts, config.random_batch_size, config.is_reranker,
+        ),
     };
     println!("Generating {dataset_label}...");
     let gen_start = Instant::now();
@@ -442,6 +458,7 @@ pub async fn run_benchmark(config: &BenchConfig) -> Result<serde_json::Value> {
                 config.seed,
                 &config.request_id_prefix,
                 config.prompt_token_ids,
+                config.random_batch_size,
             )?
         }
         DatasetName::RandomMm => {
@@ -558,6 +575,55 @@ pub async fn run_benchmark(config: &BenchConfig) -> Result<serde_json::Value> {
                 config.disable_shuffle,
             )?
         }
+        DatasetName::Custom => {
+            let tok = tokenizer
+                .as_ref()
+                .ok_or_else(|| BenchError::Config("Custom dataset requires a tokenizer".into()))?;
+            let path = config.dataset_path.as_deref().ok_or_else(|| {
+                BenchError::Config("--dataset-path is required for --dataset-name custom".into())
+            })?;
+            crate::datasets::custom::load_custom_dataset(
+                tok,
+                path,
+                config.num_prompts,
+                config.custom_output_len,
+                config.seed,
+                &config.request_id_prefix,
+                config.no_oversample,
+                config.disable_shuffle,
+            )?
+        }
+        DatasetName::PrefixRepetition => {
+            let tok = tokenizer.as_ref().ok_or_else(|| {
+                BenchError::Config("Prefix repetition dataset requires a tokenizer".into())
+            })?;
+            crate::datasets::prefix_repetition::generate_prefix_repetition_dataset(
+                tok,
+                config.num_prompts,
+                config.prefix_repetition_prefix_len,
+                config.prefix_repetition_suffix_len,
+                config.prefix_repetition_num_prefixes,
+                config.prefix_repetition_output_len,
+                config.seed,
+                &config.request_id_prefix,
+                config.disable_shuffle,
+            )?
+        }
+        DatasetName::RandomRerank => {
+            let tok = tokenizer.as_ref().ok_or_else(|| {
+                BenchError::Config("Random rerank dataset requires a tokenizer".into())
+            })?;
+            crate::datasets::random_rerank::generate_random_rerank_dataset(
+                tok,
+                config.num_prompts,
+                config.random_input_len,
+                config.random_range_ratio,
+                config.seed,
+                &config.request_id_prefix,
+                config.random_batch_size,
+                config.is_reranker,
+            )?
+        }
     };
 
     let gen_elapsed = gen_start.elapsed();
@@ -618,6 +684,7 @@ pub async fn run_benchmark(config: &BenchConfig) -> Result<serde_json::Value> {
         prompt_token_ids: first.prompt_token_ids.clone(),
         multi_modal_content: first.multi_modal_content.clone(),
         chat_messages_json: first.chat_messages_json.clone(),
+        prompt_list: first.prompt_list.clone(),
     };
 
     // Ready check
@@ -650,11 +717,16 @@ pub async fn run_benchmark(config: &BenchConfig) -> Result<serde_json::Value> {
     let has_token_ids = input_requests
         .first()
         .is_some_and(|r| r.prompt_token_ids.is_some());
-    if config.dataset_name == DatasetName::Random && has_token_ids && !config.backend.is_pooling() {
+    // Python aligns prompts to the server tokenizer for random AND prefix_repetition
+    // (both are synthetic exact-length datasets).
+    let verifiable_dataset = matches!(
+        config.dataset_name,
+        DatasetName::Random | DatasetName::PrefixRepetition
+    );
+    if verifiable_dataset && has_token_ids && !config.backend.is_pooling() {
         println!("Using prompt_token_ids, skipping server-side tokenizer verification.");
     }
-    if config.dataset_name == DatasetName::Random && !has_token_ids && !config.backend.is_pooling()
-    {
+    if verifiable_dataset && !has_token_ids && !config.backend.is_pooling() {
         let cache_key = tokenizer_verify_cache_key(&config.base_url, &model_id);
         if is_tokenizer_verified(&cache_key) {
             println!("Tokenizer verified in previous run (cached), skipping verification.");
@@ -879,6 +951,7 @@ pub async fn run_benchmark(config: &BenchConfig) -> Result<serde_json::Value> {
         let prompt_token_ids = request.prompt_token_ids.clone();
         let multi_modal_content = request.multi_modal_content.clone();
         let chat_messages_json = request.chat_messages_json.clone();
+        let prompt_list = request.prompt_list.clone();
 
         let delay_dur = std::time::Duration::from_secs_f64(*delay);
         let bench_start = benchmark_start;
@@ -921,6 +994,7 @@ pub async fn run_benchmark(config: &BenchConfig) -> Result<serde_json::Value> {
                     prompt_token_ids,
                     multi_modal_content,
                     chat_messages_json,
+                    prompt_list,
                 };
 
                 // Send request, retry on connection errors
@@ -1149,9 +1223,7 @@ mod max_model_len_tests {
             prompt_len,
             expected_output_len,
             request_id: None,
-            prompt_token_ids: None,
-            multi_modal_content: None,
-            chat_messages_json: None,
+            ..Default::default()
         }
     }
 

@@ -130,9 +130,7 @@ pub fn load_sharegpt_dataset(
             prompt_len,
             expected_output_len: new_output_len,
             request_id: Some(format!("{request_id_prefix}{ind}")),
-            prompt_token_ids: None,
-            multi_modal_content: None,
-            chat_messages_json: None,
+            ..Default::default()
         });
         ind += 1;
     }

@@ -160,6 +160,11 @@ pub async fn run_multi_turn_benchmark(config: &BenchConfig) -> Result<serde_json
                 "SPEED-Bench multi-turn is not yet supported. Use 'random' or 'sharegpt' with --multi-turn.".into(),
             ));
         }
+        DatasetName::Custom | DatasetName::PrefixRepetition | DatasetName::RandomRerank => {
+            return Err(BenchError::Config(
+                "This dataset does not support multi-turn. Use 'random' or 'sharegpt' with --multi-turn.".into(),
+            ));
+        }
         DatasetName::Hf => {
             return Err(BenchError::Config(
                 "HF dataset multi-turn is not yet supported. Use 'random' or 'sharegpt' with --multi-turn.".into(),
@@ -246,10 +251,7 @@ pub async fn run_multi_turn_benchmark(config: &BenchConfig) -> Result<serde_json
             extra_body: config.extra_body.clone(),
             ignore_eos: config.ignore_eos,
             request_id: None,
-            messages: None,
-            prompt_token_ids: None,
-            multi_modal_content: None,
-            chat_messages_json: None,
+            ..Default::default()
         };
 
         println!("Starting initial single prompt test run...");
@@ -668,9 +670,7 @@ async fn run_conversation(
             ignore_eos,
             request_id: Some(format!("{}-turn{}", conversation.conversation_id, turn_idx)),
             messages: Some(serde_json::json!(messages)),
-            prompt_token_ids: None,
-            multi_modal_content: None,
-            chat_messages_json: None,
+            ..Default::default()
         };
 
         // Acquire semaphore permit before sending the request.

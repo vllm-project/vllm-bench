@@ -33,6 +33,84 @@ pub struct RampUpConfig {
     pub end_rps: f64,
 }
 
+/// Range ratio for sampling input/output lengths, matching Python
+/// `vllm bench serve`: lengths are drawn uniformly from [len*(1-r), len*(1+r)].
+/// A single float applies to both; the JSON form '{"input": r1, "output": r2}'
+/// controls them independently. Each ratio must be in [0, 1).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RangeRatio {
+    pub input: f64,
+    pub output: f64,
+}
+
+impl RangeRatio {
+    /// Parse `--random-range-ratio`: a bare float or a JSON object with
+    /// "input" and "output" keys.
+    pub fn parse(raw: &str) -> Result<Self> {
+        let trimmed = raw.trim();
+        let (input, output) = if let Ok(v) = trimmed.parse::<f64>() {
+            (v, v)
+        } else {
+            let v: serde_json::Value = serde_json::from_str(trimmed).map_err(|_| {
+                BenchError::Config(format!(
+                    "Invalid --random-range-ratio '{raw}': expected a float or \
+                     '{{\"input\": r1, \"output\": r2}}'"
+                ))
+            })?;
+            let obj = v.as_object().ok_or_else(|| {
+                BenchError::Config(
+                    "--random-range-ratio JSON form must be an object with \
+                     'input' and 'output' keys"
+                        .into(),
+                )
+            })?;
+            let get = |key: &str| -> Result<f64> {
+                obj.get(key).and_then(|v| v.as_f64()).ok_or_else(|| {
+                    BenchError::Config(format!(
+                        "--random-range-ratio JSON form must contain a numeric '{key}' key"
+                    ))
+                })
+            };
+            (get("input")?, get("output")?)
+        };
+
+        for (name, r) in [("input", input), ("output", output)] {
+            if !(0.0..1.0).contains(&r) {
+                let hint = if r == 1.0 {
+                    " NOTE: semantics now match Python vllm bench serve — lengths are \
+                     sampled from [len*(1-r), len*(1+r)] and 0.0 means fixed length. \
+                     The old Rust-only default 1.0 ([len*r, len]) is no longer valid."
+                } else {
+                    ""
+                };
+                return Err(BenchError::Config(format!(
+                    "--random-range-ratio {name} ratio must be in [0, 1), got {r}.{hint}"
+                )));
+            }
+        }
+        Ok(Self { input, output })
+    }
+
+    /// Sampling interval for input lengths: [floor(len*(1-r)), ceil(len*(1+r))].
+    pub fn input_bounds(&self, len: usize) -> (usize, usize) {
+        let low = ((len as f64) * (1.0 - self.input)).floor() as usize;
+        let high = ((len as f64) * (1.0 + self.input)).ceil() as usize;
+        (low, high)
+    }
+
+    /// Sampling interval for output lengths, clamped to at least 1 token.
+    pub fn output_bounds(&self, len: usize) -> (usize, usize) {
+        let low = (((len as f64) * (1.0 - self.output)).floor() as usize).max(1);
+        let high = (((len as f64) * (1.0 + self.output)).ceil() as usize).max(1);
+        (low, high)
+    }
+
+    /// True when both ratios are 0 (every request uses the exact target lengths).
+    pub fn is_fixed(&self) -> bool {
+        self.input == 0.0 && self.output == 0.0
+    }
+}
+
 /// Validated benchmark configuration derived from CLI args.
 #[derive(Debug, Clone)]
 pub struct BenchConfig {
@@ -52,9 +130,18 @@ pub struct BenchConfig {
     pub random_input_len: usize,
     pub random_output_len: usize,
     pub random_prefix_len: usize,
-    pub random_range_ratio: f64,
+    pub random_range_ratio: RangeRatio,
     pub random_cache_hit_fraction: f64,
     pub random_cache_ratio: f64,
+    /// Inputs per request for embeddings/pooling backends (1 = no batching).
+    pub random_batch_size: usize,
+    /// random-rerank: whether the served model is a reranker (default true).
+    pub is_reranker: bool,
+    pub custom_output_len: i64,
+    pub prefix_repetition_prefix_len: usize,
+    pub prefix_repetition_suffix_len: usize,
+    pub prefix_repetition_num_prefixes: usize,
+    pub prefix_repetition_output_len: usize,
     pub sharegpt_output_len: Option<usize>,
     pub sonnet_input_len: usize,
     pub sonnet_output_len: usize,
@@ -351,6 +438,84 @@ impl BenchConfig {
         // Note: --dataset-path is optional for sharegpt (auto-downloads) and
         // sonnet (uses built-in Shakespeare's sonnets).
 
+        // Range ratio (Python semantics: [len*(1-r), len*(1+r)], each r in [0,1))
+        let random_range_ratio = RangeRatio::parse(&cli.random_range_ratio)?;
+
+        // Batched inputs only make sense for pooling backends (the generation
+        // backends send one prompt per request).
+        if cli.random_batch_size == 0 {
+            return Err(BenchError::Config(
+                "--random-batch-size must be at least 1".into(),
+            ));
+        }
+        if cli.random_batch_size > 1
+            && !cli.backend.is_pooling()
+            && cli.dataset_name != DatasetName::RandomRerank
+        {
+            return Err(BenchError::Config(
+                "--random-batch-size > 1 is only supported with embeddings/pooling backends".into(),
+            ));
+        }
+
+        // random-rerank validation (mirrors Python RandomDatasetForReranking)
+        let is_reranker = !cli.no_reranker;
+        if cli.dataset_name == DatasetName::RandomRerank {
+            if !cli.backend.is_pooling() {
+                return Err(BenchError::Config(
+                    "--dataset-name random-rerank requires an embeddings/pooling backend \
+                     (e.g. --backend vllm-rerank)"
+                        .into(),
+                ));
+            }
+            if !is_reranker && (cli.num_prompts < 2 || cli.random_batch_size < 2) {
+                return Err(BenchError::Config(
+                    "--no-reranker requires --num-prompts > 1 and --random-batch-size > 1 \
+                     (the query is folded into the first batch slot)"
+                        .into(),
+                ));
+            }
+        }
+
+        // Custom dataset validation
+        if cli.dataset_name == DatasetName::Custom {
+            match cli.dataset_path.as_deref() {
+                None => {
+                    return Err(BenchError::Config(
+                        "--dataset-path is required for --dataset-name custom \
+                         (a JSONL file with {\"prompt\": ..., \"output_tokens\": ...} lines)"
+                            .into(),
+                    ));
+                }
+                Some(p) if !p.ends_with(".jsonl") => {
+                    return Err(BenchError::Config(
+                        "Only JSONL format is supported for the custom dataset".into(),
+                    ));
+                }
+                _ => {}
+            }
+            if !cli.skip_chat_template {
+                eprintln!(
+                    "NOTE: client-side chat template rendering is not supported; custom \
+                     dataset prompts are sent raw (equivalent to --skip-chat-template)."
+                );
+            }
+        }
+
+        // Prefix repetition validation
+        if cli.dataset_name == DatasetName::PrefixRepetition {
+            if cli.prefix_repetition_num_prefixes == 0 {
+                return Err(BenchError::Config(
+                    "--prefix-repetition-num-prefixes must be at least 1".into(),
+                ));
+            }
+            if cli.num_prompts < cli.prefix_repetition_num_prefixes {
+                return Err(BenchError::Config(format!(
+                    "--num-prompts ({}) must be >= --prefix-repetition-num-prefixes ({})",
+                    cli.num_prompts, cli.prefix_repetition_num_prefixes
+                )));
+            }
+        }
+
         // HF dataset validation
         if cli.dataset_name == DatasetName::Hf && cli.dataset_path.is_none() {
             return Err(BenchError::Config(
@@ -487,7 +652,19 @@ impl BenchConfig {
             random_input_len,
             random_output_len,
             random_prefix_len: cli.random_prefix_len,
-            random_range_ratio: cli.random_range_ratio,
+            random_range_ratio,
+            random_batch_size: cli.random_batch_size,
+            is_reranker,
+            custom_output_len: cli
+                .output_len
+                .map(|v| v as i64)
+                .unwrap_or(cli.custom_output_len),
+            prefix_repetition_prefix_len: cli.prefix_repetition_prefix_len,
+            prefix_repetition_suffix_len: cli.prefix_repetition_suffix_len,
+            prefix_repetition_num_prefixes: cli.prefix_repetition_num_prefixes,
+            prefix_repetition_output_len: cli
+                .output_len
+                .unwrap_or(cli.prefix_repetition_output_len),
             random_cache_hit_fraction: cli.random_cache_hit_fraction,
             random_cache_ratio: cli.random_cache_ratio,
             sharegpt_output_len: cli.sharegpt_output_len,
@@ -908,5 +1085,41 @@ mod tests {
         let cli = Cli::parse_from(args);
 
         assert!(BenchConfig::from_cli(&cli).is_err());
+    }
+    #[test]
+    fn test_range_ratio_parse_float() {
+        let rr = RangeRatio::parse("0.2").unwrap();
+        assert_eq!(rr.input, 0.2);
+        assert_eq!(rr.output, 0.2);
+        assert!(!rr.is_fixed());
+        assert!(RangeRatio::parse("0.0").unwrap().is_fixed());
+    }
+
+    #[test]
+    fn test_range_ratio_parse_dict() {
+        let rr = RangeRatio::parse(r#"{"input": 0.1, "output": 0.5}"#).unwrap();
+        assert_eq!(rr.input, 0.1);
+        assert_eq!(rr.output, 0.5);
+    }
+
+    #[test]
+    fn test_range_ratio_rejects_old_default_with_hint() {
+        let err = RangeRatio::parse("1.0").unwrap_err().to_string();
+        assert!(err.contains("semantics now match Python"), "got: {err}");
+        assert!(RangeRatio::parse("-0.1").is_err());
+        assert!(RangeRatio::parse("{\"input\": 0.1}").is_err());
+        assert!(RangeRatio::parse("abc").is_err());
+    }
+
+    #[test]
+    fn test_range_ratio_bounds_python_semantics() {
+        // Python: [floor(len*(1-r)), ceil(len*(1+r))], output low clamped to 1
+        let rr = RangeRatio::parse("0.2").unwrap();
+        assert_eq!(rr.input_bounds(100), (80, 120));
+        assert_eq!(rr.output_bounds(100), (80, 120));
+        let rr = RangeRatio::parse("0.99").unwrap();
+        assert_eq!(rr.output_bounds(1).0, 1); // clamped
+        let fixed = RangeRatio::parse("0.0").unwrap();
+        assert_eq!(fixed.input_bounds(8192), (8192, 8192));
     }
 }

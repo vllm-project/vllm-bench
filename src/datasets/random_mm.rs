@@ -300,7 +300,7 @@ pub fn generate_random_mm_dataset(
     input_len: usize,
     output_len: usize,
     prefix_len: usize,
-    range_ratio: f64,
+    range_ratio: crate::config::RangeRatio,
     seed: u64,
     request_id_prefix: &str,
     base_items_per_request: usize,
@@ -309,11 +309,6 @@ pub fn generate_random_mm_dataset(
     buckets: &[(MmBucketKey, f64)],
     enable_multimodal_chat: bool,
 ) -> Result<Vec<SampleRequest>> {
-    if !(range_ratio > 0.0 && range_ratio <= 1.0) {
-        return Err(BenchError::Config(
-            "range_ratio must be in (0, 1]. Use 1.0 for fixed-length prompts.".into(),
-        ));
-    }
     if !(0.0..=1.0).contains(&num_mm_items_range_ratio) {
         return Err(BenchError::Config(
             "num_mm_items_range_ratio must be in [0, 1]".into(),
@@ -350,11 +345,9 @@ pub fn generate_random_mm_dataset(
     let num_special = tokenizer.num_special_tokens_to_add();
     let real_input_len = input_len.saturating_sub(num_special);
 
-    // range_ratio=0.8 → [80% of target, target]
-    let input_low = ((real_input_len as f64) * range_ratio).floor() as usize;
-    let input_high = real_input_len;
-    let output_low = ((output_len as f64) * range_ratio).floor().max(1.0) as usize;
-    let output_high = output_len;
+    // Python semantics: sample uniformly from [len*(1-r), len*(1+r)].
+    let (input_low, input_high) = range_ratio.input_bounds(real_input_len);
+    let (output_low, output_high) = range_ratio.output_bounds(output_len);
 
     // Pre-generate per-request params
     let mut rng = StdRng::seed_from_u64(seed);
@@ -474,9 +467,9 @@ pub fn generate_random_mm_dataset(
                 prompt_len: target_lens[i],
                 expected_output_len: params[i].output_len,
                 request_id: Some(format!("{rid_prefix}{i}")),
-                prompt_token_ids: None,
                 multi_modal_content: mm_content,
                 chat_messages_json,
+                ..Default::default()
             }
         })
         .collect();

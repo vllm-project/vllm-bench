@@ -397,9 +397,7 @@ pub fn calculate_multi_turn_metrics(
                 prompt_len: turn.cumulative_input_tokens,
                 expected_output_len: turn.request_output.output_tokens,
                 request_id: None,
-                prompt_token_ids: None,
-                multi_modal_content: None,
-                chat_messages_json: None,
+                ..Default::default()
             });
             all_outputs.push(turn.request_output.clone());
         }
@@ -427,9 +425,7 @@ pub fn calculate_multi_turn_metrics(
                     prompt_len: turn.cumulative_input_tokens,
                     expected_output_len: turn.request_output.output_tokens,
                     request_id: None,
-                    prompt_token_ids: None,
-                    multi_modal_content: None,
-                    chat_messages_json: None,
+                    ..Default::default()
                 });
                 turn_outputs.push(turn.request_output.clone());
             }
