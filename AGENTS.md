@@ -4,6 +4,8 @@
 
 Rust rewrite of `vllm bench serve` — a high-performance benchmark client for vLLM serving endpoints. Standalone binary, no Python dependency at runtime.
 
+The crate ships both a `[lib]` target (`vllm_bench`) and the `[[bin]]` (`vllm-bench`). The library exposes the full run path so external crates can register custom backends without forking (see "Custom backends" below); the binary is a thin `vllm_bench::run_cli()` wrapper (the `#[global_allocator]` lives in the binary, not the lib).
+
 ## Build & Test
 
 ```bash
@@ -19,7 +21,8 @@ cargo test -- --ignored
 
 ## Architecture
 
-- `src/main.rs` — Entry point, mimalloc, tokio runtime, mode dispatch (compare/sweep/multi-run/multi-turn/single)
+- `src/main.rs` — Thin binary entry point (mimalloc global allocator + `vllm_bench::run_cli()`)
+- `src/lib.rs` — Library root: `pub` modules, public extension API re-exports (`CustomBackend`, `register_backend`, `RequestFuncInput/Output`, `build_headers`), `run_cli`/`run` (rlimit bump, tokio runtime, mode dispatch: compare/sweep/multi-run/multi-turn/single)
 - `src/cli.rs` — clap derive CLI args (~50+ flags)
 - `src/config.rs` — Validated config from CLI; `GoodputConfig`, `RampUpConfig`, sampling param merging
 - `src/error.rs` — `BenchError` enum (Http, Json, Tokenizer, Config, EndpointTimeout, Backend, Io)
@@ -33,7 +36,8 @@ cargo test -- --ignored
 - `src/rate_control.rs` — Gamma/Poisson request scheduling + linear/exponential ramp-up
 - `src/ready_checker.rs` — Endpoint readiness with retry
 - `src/backends/` — Backend implementations (enum dispatch, not trait objects)
-  - `mod.rs` — `Backend` enum, `RequestFuncInput`/`RequestFuncOutput` (includes `messages` field for multi-turn)
+  - `mod.rs` — `Backend` enum (incl. `Custom(Arc<dyn CustomBackend>)`), `CustomBackend` trait (extension point), `RequestFuncInput`/`RequestFuncOutput` (includes `messages` field for multi-turn), `get_backend` factory
+  - `registry.rs` — Process-global registry for external custom backends (`register_backend`, `lookup`, `set_active`/`active_custom`); keeps `get_backend(BackendKind)` signature unchanged
   - `streaming.rs` — SSE parser (`StreamedResponseHandler`) with speculative JSON parse for split TCP segments
   - `openai_completions.rs` — `/v1/completions` backend
   - `openai_chat.rs` — `/v1/chat/completions` backend (uses `input.messages` when set; zero-copy raw JSON payload for multimodal)
@@ -56,7 +60,8 @@ cargo test -- --ignored
 
 ## Key Design Decisions
 
-- **Enum dispatch** for backends (avoids async trait object issues with `dyn`)
+- **Enum dispatch** for backends (avoids async trait object issues with `dyn`); the one exception is `Backend::Custom(Arc<dyn CustomBackend>)`, where externally-registered backends pay a small boxing/dynamic-dispatch cost via `async-trait`. Built-ins stay zero-cost.
+- **Custom backends are compile-time, registered into a process-global registry**: external crates depend on the `vllm_bench` lib, `register_backend("name", Arc::new(...))` before `run_cli()`, and select with `--backend name`. The global registry (`backends/registry.rs`) lets `get_backend(BackendKind)` and every call site stay parameter-free. `--backend` is a `String` resolved in `config.rs` (built-in via `BackendKind::from_name`, else registry lookup, else error listing available names); backend metadata (`is_pooling`, OpenAI-compat, endpoint, display name) is read from the trait once and cached on `BenchConfig` (`is_pooling`, `backend_name`).
 - **reqwest http1_only()** to match Python aiohttp behavior
 - **rayon** for parallel dataset generation (key perf win over Python)
 - **mimalloc** global allocator to reduce contention at 1400+ concurrency (page-agnostic; works on aarch64 64K-page kernels where jemalloc aborts with `LG_PAGE=12` builds)
@@ -77,6 +82,44 @@ cargo test -- --ignored
 - **localhost vs 127.0.0.1**: Some systems resolve `localhost` to IPv6 `::1` while vLLM listens on IPv4 only. Use `127.0.0.1` or the actual hostname.
 - **Models without tokenizer.json** (e.g., `nvidia/Kimi-K2.5-NVFP4`): Automatically falls back to server-side tokenization. Can also use `--tokenizer` to point to a model with `tokenizer.json`.
 - **usage.completion_tokens parsing**: vLLM sends final usage chunk with `"choices":[]` (empty array). The usage `if` must be separate from the choices `if` (not `else if`).
+
+## Custom Backends (external extensions)
+
+Add a backend without forking by depending on the `vllm_bench` library and registering an
+implementation of the `CustomBackend` trait. Examples:
+
+- `examples/custom_backend.rs` — OpenAI-compatible streaming backend
+  (`cargo run --example custom_backend -- --backend my-llm ...`).
+- `examples/fake_backend.rs` + `examples/fake_server.py` — a **non-OpenAI** ("FakeGen")
+  protocol end-to-end. Run `examples/run_demo.sh` to spin up the FastAPI server, build the
+  custom backend, and benchmark it with `--backend fakegen` (proves non-OpenAI endpoints work).
+
+```rust
+use std::sync::Arc;
+use vllm_bench::{build_headers, CustomBackend, RequestFuncInput, RequestFuncOutput, Result};
+
+struct MyBackend;
+
+#[async_trait::async_trait]
+impl CustomBackend for MyBackend {
+    fn default_endpoint(&self) -> String { "/v1/completions".into() }
+    // Optional: fn is_pooling(&self) -> bool / fn is_openai_compatible(&self) -> bool
+    async fn send_request(
+        &self,
+        input: &RequestFuncInput,
+        client: &reqwest::Client,
+    ) -> Result<RequestFuncOutput> {
+        // Build payload, send via `client`, fill timing metrics (ttft/itl/latency/output_tokens).
+        // Reuse `build_headers(...)` and `vllm_bench::StreamedResponseHandler`.
+        Ok(RequestFuncOutput { success: true, ..Default::default() })
+    }
+}
+
+fn main() -> anyhow::Result<()> {
+    vllm_bench::register_backend("my-llm", Arc::new(MyBackend));
+    vllm_bench::run_cli() // `--backend my-llm` now selects it; built-ins still work
+}
+```
 
 ## Typical Usage
 

@@ -115,6 +115,12 @@ impl RangeRatio {
 #[derive(Debug, Clone)]
 pub struct BenchConfig {
     pub backend: BackendKind,
+    /// Original `--backend` value (built-in name or custom registry key). Used
+    /// for display/JSON output, where `Custom` would otherwise collapse to "custom".
+    pub backend_name: String,
+    /// Whether the resolved backend is a non-generative pooling/embedding backend.
+    /// Cached here because custom backends report this via the trait, not `BackendKind`.
+    pub is_pooling: bool,
     pub base_url: String,
     pub api_url: String,
     pub model: Option<String>,
@@ -238,7 +244,56 @@ impl BenchConfig {
         }
 
         let base_url = cli.resolve_base_url();
-        let api_url = cli.resolve_api_url();
+
+        // Resolve the backend: a built-in name, or a registered custom backend.
+        let (backend, custom_backend): (
+            BackendKind,
+            Option<Arc<dyn crate::backends::CustomBackend>>,
+        ) = match BackendKind::from_name(&cli.backend) {
+            Some(k) => (k, None),
+            None => match crate::backends::registry::lookup(&cli.backend) {
+                Some(c) => (BackendKind::Custom, Some(c)),
+                None => {
+                    let registered = crate::backends::registered_backend_names();
+                    let extra = if registered.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" Registered custom backends: {}.", registered.join(", "))
+                    };
+                    return Err(BenchError::Config(format!(
+                        "Unknown --backend '{}'. Built-in backends: {}.{}",
+                        cli.backend,
+                        BackendKind::builtin_names(),
+                        extra
+                    )));
+                }
+            },
+        };
+
+        // Cache backend metadata. Custom backends report capabilities via the
+        // trait; built-ins via `BackendKind`.
+        let is_pooling = custom_backend
+            .as_ref()
+            .map(|c| c.is_pooling())
+            .unwrap_or_else(|| backend.is_pooling());
+        let is_openai_compatible = custom_backend
+            .as_ref()
+            .map(|c| c.is_openai_compatible())
+            .unwrap_or_else(|| backend.is_openai_compatible());
+        let backend_name = cli.backend.clone();
+
+        // Resolve the API endpoint: explicit --endpoint wins, else backend default.
+        let endpoint = match (&cli.endpoint, &custom_backend) {
+            (Some(ep), _) => ep.clone(),
+            (None, Some(c)) => c.default_endpoint(),
+            (None, None) => backend.default_endpoint().to_string(),
+        };
+        let api_url = format!("{base_url}{endpoint}");
+
+        // Publish the selected custom backend so `get_backend()` can resolve it.
+        if let Some(c) = custom_backend {
+            crate::backends::registry::set_active(c);
+        }
 
         let extra_headers = cli.parse_headers()?;
         let mut extra_body = cli.parse_extra_body()?;
@@ -271,7 +326,7 @@ impl BenchConfig {
             }
 
             if !sampling_params.is_empty() {
-                if !cli.backend.is_openai_compatible() {
+                if !is_openai_compatible {
                     return Err(BenchError::Config(
                         "Sampling parameters are only supported by openai-compatible backends."
                             .into(),
@@ -318,7 +373,7 @@ impl BenchConfig {
         let ramp_up = parse_ramp_up(cli)?;
 
         // Default percentile metrics based on backend type
-        let default_percentile_metrics = if cli.backend.is_pooling() {
+        let default_percentile_metrics = if is_pooling {
             "e2el"
         } else {
             "ttft,tpot,itl,e2el"
@@ -371,18 +426,18 @@ impl BenchConfig {
         // Exception: multi-turn mode, where ignore_eos causes unbounded context growth
         // across turns. Multi-turn uses min_tokens instead for output length control.
         // Pooling backends don't generate tokens, so ignore_eos is irrelevant.
-        let ignore_eos = if cli.backend.is_pooling() {
+        let ignore_eos = if is_pooling {
             false
         } else {
             cli.ignore_eos
                 || ((cli.dataset_name == DatasetName::Random
                     || cli.dataset_name == DatasetName::RandomMm)
-                    && cli.backend.is_openai_compatible()
+                    && is_openai_compatible
                     && !cli.multi_turn)
         };
 
         // Pooling backends don't support multi-turn
-        if cli.backend.is_pooling() && cli.multi_turn {
+        if is_pooling && cli.multi_turn {
             return Err(BenchError::Config(
                 "Pooling/embedding backends do not support --multi-turn".into(),
             ));
@@ -398,7 +453,7 @@ impl BenchConfig {
                         "--lora-modules requires at least one adapter name".into(),
                     ));
                 }
-                if cli.backend.is_pooling() {
+                if is_pooling {
                     return Err(BenchError::Config(
                         "--lora-modules is not supported for pooling/embedding backends".into(),
                     ));
@@ -419,7 +474,7 @@ impl BenchConfig {
 
         // Random-MM validation and config parsing
         let (random_mm_limit, random_mm_buckets) = if cli.dataset_name == DatasetName::RandomMm {
-            if cli.backend != BackendKind::OpenaiChat {
+            if backend != BackendKind::OpenaiChat {
                 return Err(BenchError::Config(
                     "Multi-modal content (images) is only supported on 'openai-chat' backend."
                         .into(),
@@ -448,9 +503,7 @@ impl BenchConfig {
                 "--random-batch-size must be at least 1".into(),
             ));
         }
-        if cli.random_batch_size > 1
-            && !cli.backend.is_pooling()
-            && cli.dataset_name != DatasetName::RandomRerank
+        if cli.random_batch_size > 1 && !is_pooling && cli.dataset_name != DatasetName::RandomRerank
         {
             return Err(BenchError::Config(
                 "--random-batch-size > 1 is only supported with embeddings/pooling backends".into(),
@@ -460,7 +513,7 @@ impl BenchConfig {
         // random-rerank validation (mirrors Python RandomDatasetForReranking)
         let is_reranker = !cli.no_reranker;
         if cli.dataset_name == DatasetName::RandomRerank {
-            if !cli.backend.is_pooling() {
+            if !is_pooling {
                 return Err(BenchError::Config(
                     "--dataset-name random-rerank requires an embeddings/pooling backend \
                      (e.g. --backend vllm-rerank)"
@@ -534,7 +587,7 @@ impl BenchConfig {
 
         // Multi-turn validation
         if cli.multi_turn {
-            if cli.backend != BackendKind::OpenaiChat {
+            if backend != BackendKind::OpenaiChat {
                 return Err(BenchError::Config(
                     "--multi-turn requires --backend openai-chat".into(),
                 ));
@@ -637,7 +690,9 @@ impl BenchConfig {
         }
 
         Ok(BenchConfig {
-            backend: cli.backend,
+            backend,
+            backend_name,
+            is_pooling,
             base_url,
             api_url,
             model: cli.model.clone(),

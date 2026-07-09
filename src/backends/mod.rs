@@ -4,7 +4,10 @@
 pub mod openai_chat;
 pub mod openai_completions;
 pub mod pooling;
+pub mod registry;
 pub mod streaming;
+
+pub use registry::{register_backend, registered_backend_names};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -143,12 +146,44 @@ impl Default for RequestFuncInput {
     }
 }
 
+/// A backend supplied externally to this crate.
+///
+/// Built-in backends use zero-cost enum dispatch; custom backends are boxed
+/// behind this trait and reached through [`Backend::Custom`]. Implementors get
+/// the same request contract — reuse [`build_headers`],
+/// [`streaming::StreamedResponseHandler`], and [`RequestFuncInput`]/
+/// [`RequestFuncOutput`] just like the built-ins.
+#[async_trait::async_trait]
+pub trait CustomBackend: Send + Sync {
+    /// Send a single request and collect timing metrics.
+    async fn send_request(
+        &self,
+        input: &RequestFuncInput,
+        client: &reqwest::Client,
+    ) -> Result<RequestFuncOutput>;
+
+    /// Endpoint path appended to `--base-url` when `--endpoint` is not given.
+    fn default_endpoint(&self) -> String;
+
+    /// Whether sampling parameters (`--temperature`, etc.) are accepted.
+    fn is_openai_compatible(&self) -> bool {
+        true
+    }
+
+    /// Whether this is a non-generative pooling/embedding backend.
+    fn is_pooling(&self) -> bool {
+        false
+    }
+}
+
 /// Enum dispatch for backend implementations (avoids async trait object issues).
+/// `Custom` is the one boxed variant, for externally-registered backends.
 #[derive(Clone)]
 pub enum Backend {
     OpenAICompletions(openai_completions::OpenAICompletionsBackend),
     OpenAIChat(openai_chat::OpenAIChatBackend),
     Pooling(pooling::PoolingBackend),
+    Custom(Arc<dyn CustomBackend>),
 }
 
 impl Backend {
@@ -162,6 +197,7 @@ impl Backend {
             Backend::OpenAICompletions(b) => b.send_request(input, client).await,
             Backend::OpenAIChat(b) => b.send_request(input, client).await,
             Backend::Pooling(b) => b.send_request(input, client).await,
+            Backend::Custom(b) => b.send_request(input, client).await,
         }
     }
 }
@@ -173,6 +209,14 @@ pub fn get_backend(kind: BackendKind) -> Result<Backend> {
             openai_completions::OpenAICompletionsBackend,
         )),
         BackendKind::OpenaiChat => Ok(Backend::OpenAIChat(openai_chat::OpenAIChatBackend)),
+        BackendKind::Custom => registry::active_custom()
+            .map(Backend::Custom)
+            .ok_or_else(|| {
+                crate::error::BenchError::Backend(
+                    "custom backend selected but none is active (register it before running)"
+                        .into(),
+                )
+            }),
         kind if kind.is_pooling() => Ok(Backend::Pooling(pooling::PoolingBackend { kind })),
         _ => unreachable!(),
     }

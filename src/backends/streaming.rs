@@ -11,6 +11,12 @@ pub struct StreamedResponseHandler {
     messages: Vec<String>,
 }
 
+impl Default for StreamedResponseHandler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl StreamedResponseHandler {
     pub fn new() -> Self {
         Self {

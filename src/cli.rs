@@ -22,6 +22,10 @@ pub enum BackendKind {
     VllmPooling,
     #[value(name = "vllm-rerank")]
     VllmRerank,
+    /// Externally-registered backend (resolved by name via the library registry).
+    /// Not selectable as a literal clap value — constructed during config resolution.
+    #[value(skip)]
+    Custom,
 }
 
 impl BackendKind {
@@ -34,6 +38,40 @@ impl BackendKind {
             Self::OpenaiEmbeddingsChat => "openai-embeddings-chat",
             Self::VllmPooling => "vllm-pooling",
             Self::VllmRerank => "vllm-rerank",
+            Self::Custom => "custom",
+        }
+    }
+
+    /// Resolve a built-in backend from its CLI name. Returns `None` for names
+    /// that are not built in (which may be registered custom backends).
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "vllm" => Some(Self::Vllm),
+            "openai" => Some(Self::Openai),
+            "openai-chat" => Some(Self::OpenaiChat),
+            "openai-embeddings" => Some(Self::OpenaiEmbeddings),
+            "openai-embeddings-chat" => Some(Self::OpenaiEmbeddingsChat),
+            "vllm-pooling" => Some(Self::VllmPooling),
+            "vllm-rerank" => Some(Self::VllmRerank),
+            _ => None,
+        }
+    }
+
+    /// Comma-separated list of built-in backend names (for help/error messages).
+    pub fn builtin_names() -> &'static str {
+        "vllm, openai, openai-chat, openai-embeddings, openai-embeddings-chat, \
+         vllm-pooling, vllm-rerank"
+    }
+
+    /// Default endpoint path for built-in backends. `Custom` is a placeholder;
+    /// custom backends supply their own via `CustomBackend::default_endpoint`.
+    pub fn default_endpoint(self) -> &'static str {
+        match self {
+            Self::OpenaiChat => "/v1/chat/completions",
+            Self::Vllm | Self::Openai | Self::Custom => "/v1/completions",
+            Self::OpenaiEmbeddings | Self::OpenaiEmbeddingsChat => "/v1/embeddings",
+            Self::VllmPooling => "/v1/pooling",
+            Self::VllmRerank => "/v1/rerank",
         }
     }
 
@@ -41,7 +79,8 @@ impl BackendKind {
     pub fn is_openai_compatible(self) -> bool {
         match self {
             Self::Vllm | Self::Openai | Self::OpenaiChat => true,
-            Self::OpenaiEmbeddings
+            Self::Custom
+            | Self::OpenaiEmbeddings
             | Self::OpenaiEmbeddingsChat
             | Self::VllmPooling
             | Self::VllmRerank => false,
@@ -152,8 +191,12 @@ impl fmt::Display for SpeedBenchConfig {
 )]
 pub struct Cli {
     /// The type of backend or endpoint to use for the benchmark.
+    ///
+    /// Built-ins: vllm, openai, openai-chat, openai-embeddings,
+    /// openai-embeddings-chat, vllm-pooling, vllm-rerank. Any other value is
+    /// resolved against backends registered via the library API.
     #[arg(long, default_value = "openai")]
-    pub backend: BackendKind,
+    pub backend: String,
 
     /// Server or API base url if not using http host and port.
     #[arg(long)]
@@ -663,27 +706,6 @@ impl Cli {
         }
     }
 
-    /// Resolve the API endpoint, auto-selecting based on backend if not explicit.
-    pub fn resolve_endpoint(&self) -> String {
-        if let Some(ref ep) = self.endpoint {
-            return ep.clone();
-        }
-        match self.backend {
-            BackendKind::OpenaiChat => "/v1/chat/completions".to_string(),
-            BackendKind::Vllm | BackendKind::Openai => "/v1/completions".to_string(),
-            BackendKind::OpenaiEmbeddings | BackendKind::OpenaiEmbeddingsChat => {
-                "/v1/embeddings".to_string()
-            }
-            BackendKind::VllmPooling => "/v1/pooling".to_string(),
-            BackendKind::VllmRerank => "/v1/rerank".to_string(),
-        }
-    }
-
-    /// Resolve the full API URL.
-    pub fn resolve_api_url(&self) -> String {
-        format!("{}{}", self.resolve_base_url(), self.resolve_endpoint())
-    }
-
     /// Parse extra headers from KEY=VALUE pairs.
     pub fn parse_headers(
         &self,
@@ -740,5 +762,39 @@ impl Cli {
         } else {
             self.resolved_random_input_len()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::ValueEnum;
+    use std::collections::HashSet;
+
+    /// `as_str`, `from_name`, and `builtin_names` are three hand-synced lists;
+    /// this guards against drift when a new backend variant is added.
+    /// `value_variants()` yields exactly the built-ins ( `Custom` is `#[value(skip)]` ).
+    #[test]
+    fn backend_kind_lists_stay_in_sync() {
+        let listed: HashSet<&str> = BackendKind::builtin_names().split(", ").collect();
+        for &k in BackendKind::value_variants() {
+            assert_eq!(
+                BackendKind::from_name(k.as_str()),
+                Some(k),
+                "from_name/as_str round-trip failed for {k:?}"
+            );
+            assert!(
+                listed.contains(k.as_str()),
+                "builtin_names() is missing '{}'",
+                k.as_str()
+            );
+        }
+        assert_eq!(
+            listed.len(),
+            BackendKind::value_variants().len(),
+            "builtin_names() lists a name with no matching variant"
+        );
+        // `Custom` is not resolvable as a built-in name.
+        assert_eq!(BackendKind::from_name("custom"), None);
     }
 }
