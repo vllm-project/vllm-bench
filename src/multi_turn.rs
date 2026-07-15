@@ -120,6 +120,9 @@ pub async fn run_multi_turn_benchmark(config: &BenchConfig) -> Result<serde_json
                 seed: config.seed,
                 request_id_prefix: config.request_id_prefix.clone(),
                 prefix_sharing_config,
+                range_ratio: config.random_range_ratio,
+                cache_hit_fraction: config.random_cache_hit_fraction,
+                cache_ratio: config.random_cache_ratio,
             };
             crate::datasets::multi_turn::generate_multi_turn_random(tok, &random_cfg)?
         }
