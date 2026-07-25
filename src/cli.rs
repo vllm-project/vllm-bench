@@ -191,6 +191,13 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub skip_tokenizer_init: bool,
 
+    /// Skip the server-side /tokenize verification of prompt token counts
+    /// (random / prefix_repetition datasets). Use when the endpoint is a
+    /// gateway that does not expose /tokenize; prompt lengths then rely on
+    /// the client-side tokenizer alone.
+    #[arg(long, default_value_t = false)]
+    pub skip_tokenizer_verify: bool,
+
     /// Trust remote code for tokenizer.
     #[arg(long, default_value_t = false)]
     pub trust_remote_code: bool,
