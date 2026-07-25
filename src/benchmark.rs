@@ -713,7 +713,11 @@ pub async fn run_benchmark(config: &BenchConfig) -> Result<serde_json::Value> {
     // Uses a cache: if a previous run with the same model+server already verified OK,
     // skip entirely. Otherwise sample 10 prompts first — if all match, cache and skip.
     // If any mismatch, do full verify+fix for all prompts.
-    // Skip verification when prompt_token_ids are set (token counts are exact by construction).
+    // Skip verification when prompt_token_ids are set (token counts are exact by construction)
+    // or when --skip-tokenizer-verify is set. The latter covers gateways that neither serve
+    // /tokenize nor reject it with a 4xx, but reset the connection instead — indistinguishable
+    // at the transport layer from a server that just died, which must stay fatal. Skipping is
+    // therefore always an explicit user choice, never inferred.
     let has_token_ids = input_requests
         .first()
         .is_some_and(|r| r.prompt_token_ids.is_some());
@@ -723,61 +727,67 @@ pub async fn run_benchmark(config: &BenchConfig) -> Result<serde_json::Value> {
         config.dataset_name,
         DatasetName::Random | DatasetName::PrefixRepetition
     );
-    if verifiable_dataset && has_token_ids && !config.backend.is_pooling() {
-        println!("Using prompt_token_ids, skipping server-side tokenizer verification.");
-    }
-    if verifiable_dataset && !has_token_ids && !config.backend.is_pooling() {
-        let cache_key = tokenizer_verify_cache_key(&config.base_url, &model_id);
-        if is_tokenizer_verified(&cache_key) {
-            println!("Tokenizer verified in previous run (cached), skipping verification.");
+    if verifiable_dataset && !config.backend.is_pooling() {
+        if has_token_ids {
+            println!("Using prompt_token_ids, skipping server-side tokenizer verification.");
+        } else if config.skip_tokenizer_verify {
+            println!(
+                "Skipping server-side tokenizer verification (--skip-tokenizer-verify); \
+                 prompt lengths are client-side counts, unconfirmed by the server."
+            );
         } else {
-            let num_special = tokenizer
-                .as_ref()
-                .map(|t| t.num_special_tokens_to_add())
-                .unwrap_or(0);
-            match sample_verify_prompts(
-                &client,
-                &config.base_url,
-                &model_id,
-                &input_requests,
-                num_special,
-                &config.extra_headers,
-            )
-            .await?
-            {
-                SampleVerifyOutcome::Passed => {
-                    println!("Sample verification passed, skipping full verification.");
-                    mark_tokenizer_verified(&cache_key);
-                }
-                SampleVerifyOutcome::Skipped(reason) => {
-                    println!("Server /tokenize unavailable ({reason}), skipping verification.");
-                }
-                SampleVerifyOutcome::Mismatch => {
-                    println!("Sample verification found mismatch, running full verify+fix...");
-                    match verify_and_fix_prompt_lengths(
-                        &client,
-                        &config.base_url,
-                        &model_id,
-                        &mut input_requests,
-                        num_special,
-                        &config.extra_headers,
-                    )
-                    .await
-                    {
-                        Ok(()) => {
-                            println!(
-                                "All {} prompts verified: exact token length match.",
-                                input_requests.len()
-                            );
-                            mark_tokenizer_verified(&cache_key);
+            let cache_key = tokenizer_verify_cache_key(&config.base_url, &model_id);
+            if is_tokenizer_verified(&cache_key) {
+                println!("Tokenizer verified in previous run (cached), skipping verification.");
+            } else {
+                let num_special = tokenizer
+                    .as_ref()
+                    .map(|t| t.num_special_tokens_to_add())
+                    .unwrap_or(0);
+                match sample_verify_prompts(
+                    &client,
+                    &config.base_url,
+                    &model_id,
+                    &input_requests,
+                    num_special,
+                    &config.extra_headers,
+                )
+                .await?
+                {
+                    SampleVerifyOutcome::Passed => {
+                        println!("Sample verification passed, skipping full verification.");
+                        mark_tokenizer_verified(&cache_key);
+                    }
+                    SampleVerifyOutcome::Skipped(reason) => {
+                        println!("Server /tokenize unavailable ({reason}), skipping verification.");
+                    }
+                    SampleVerifyOutcome::Mismatch => {
+                        println!("Sample verification found mismatch, running full verify+fix...");
+                        match verify_and_fix_prompt_lengths(
+                            &client,
+                            &config.base_url,
+                            &model_id,
+                            &mut input_requests,
+                            num_special,
+                            &config.extra_headers,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                println!(
+                                    "All {} prompts verified: exact token length match.",
+                                    input_requests.len()
+                                );
+                                mark_tokenizer_verified(&cache_key);
+                            }
+                            Err(BenchError::TokenizeUnavailable(reason)) => {
+                                println!(
+                                    "Server /tokenize became unavailable during verification \
+                                     ({reason}); proceeding with client-side token counts."
+                                );
+                            }
+                            Err(e) => return Err(e),
                         }
-                        Err(BenchError::TokenizeUnavailable(reason)) => {
-                            println!(
-                                "Server /tokenize became unavailable during verification \
-                                 ({reason}); proceeding with client-side token counts."
-                            );
-                        }
-                        Err(e) => return Err(e),
                     }
                 }
             }

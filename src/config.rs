@@ -124,6 +124,7 @@ pub struct BenchConfig {
     pub tokenizer_mode: String,
     pub trust_remote_code: bool,
     pub skip_tokenizer_init: bool,
+    pub skip_tokenizer_verify: bool,
     pub dataset_name: DatasetName,
     pub dataset_path: Option<String>,
     pub max_model_len: Option<usize>,
@@ -646,6 +647,7 @@ impl BenchConfig {
             tokenizer_mode: cli.tokenizer_mode.clone(),
             trust_remote_code: cli.trust_remote_code,
             skip_tokenizer_init: cli.skip_tokenizer_init,
+            skip_tokenizer_verify: cli.skip_tokenizer_verify,
             dataset_name: cli.dataset_name,
             dataset_path: cli.dataset_path.clone(),
             max_model_len: cli.max_model_len,
@@ -1121,5 +1123,46 @@ mod tests {
         assert_eq!(rr.output_bounds(1).0, 1); // clamped
         let fixed = RangeRatio::parse("0.0").unwrap();
         assert_eq!(fixed.input_bounds(8192), (8192, 8192));
+    }
+
+    #[test]
+    fn test_skip_tokenizer_verify_defaults_to_false() {
+        let args = vec!["vllm-bench", "--model", "test-model"];
+        let cli = Cli::parse_from(args);
+        let config = BenchConfig::from_cli(&cli).unwrap();
+
+        assert!(!config.skip_tokenizer_verify);
+    }
+
+    #[test]
+    fn test_skip_tokenizer_verify_flows_from_cli() {
+        let args = vec![
+            "vllm-bench",
+            "--model",
+            "test-model",
+            "--skip-tokenizer-verify",
+        ];
+        let cli = Cli::parse_from(args);
+        let config = BenchConfig::from_cli(&cli).unwrap();
+
+        assert!(config.skip_tokenizer_verify);
+    }
+
+    #[test]
+    fn test_skip_tokenizer_verify_is_independent_of_skip_tokenizer_init() {
+        // The two flags target different stages: --skip-tokenizer-init skips loading a
+        // client-side tokenizer, --skip-tokenizer-verify skips reconciling prompt lengths
+        // with the server. Neither implies the other.
+        let args = vec![
+            "vllm-bench",
+            "--model",
+            "test-model",
+            "--skip-tokenizer-init",
+        ];
+        let cli = Cli::parse_from(args);
+        let config = BenchConfig::from_cli(&cli).unwrap();
+
+        assert!(config.skip_tokenizer_init);
+        assert!(!config.skip_tokenizer_verify);
     }
 }

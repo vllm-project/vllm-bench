@@ -77,6 +77,7 @@ cargo test -- --ignored
 - **localhost vs 127.0.0.1**: Some systems resolve `localhost` to IPv6 `::1` while vLLM listens on IPv4 only. Use `127.0.0.1` or the actual hostname.
 - **Models without tokenizer.json** (e.g., `nvidia/Kimi-K2.5-NVFP4`): Automatically falls back to server-side tokenization. Can also use `--tokenizer` to point to a model with `tokenizer.json`.
 - **usage.completion_tokens parsing**: vLLM sends final usage chunk with `"choices":[]` (empty array). The usage `if` must be separate from the choices `if` (not `else if`).
+- **Gateways without /tokenize** (e.g., API gateways like new-api): the random/prefix_repetition pre-run token-count verification calls `{base_url}/tokenize`. A 404/4xx skips gracefully, but gateways that reset the connection instead make the run fail. Use `--skip-tokenizer-verify` to skip the verification pass entirely (client-side tokenizer counts are used as-is).
 
 ## Typical Usage
 

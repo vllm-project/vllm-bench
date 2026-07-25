@@ -482,6 +482,7 @@ Run `vllm-bench --help` for the authoritative list. Grouped reference below.
 | `--tokenizer-mode` | `auto` | Tokenizer mode (`auto`, `hf`, `slow`, `mistral`) |
 | `--trust-remote-code` | `false` | Trust remote code for tokenizer |
 | `--skip-tokenizer-init` | `false` | Skip tokenizer initialization |
+| `--skip-tokenizer-verify` | `false` | Skip the server-side `/tokenize` verification of prompt token counts (`random` / `prefix_repetition`). Use when the endpoint is a gateway without a usable `/tokenize` |
 
 </details>
 
@@ -704,6 +705,8 @@ Tokenizers are loaded with a three-tier fallback chain:
 3. **Server-side** — falls back to vLLM's `/tokenize` + `/detokenize` endpoints
 
 For the `random` dataset, prompt token lengths are verified against the server on the first run and cached; subsequent runs with the same model+server skip verification. Verification is also skipped when `--prompt-token-ids` is set (token counts are exact by construction).
+
+If the server answers `/tokenize` with a 4xx (it has no such endpoint, or a gateway rejects it), verification is skipped automatically. Gateways that instead **reset the connection** are indistinguishable from a server that has died, so those stay fatal — pass `--skip-tokenizer-verify` to skip the pass entirely. Prompt lengths then come from the client-side tokenizer alone and are never reconciled with the server, so a tokenizer mismatch will silently shift your actual input lengths.
 
 Models without `tokenizer.json` (e.g. `nvidia/Kimi-K2.5-NVFP4`) fall back to server-side tokenization automatically; you can also point `--tokenizer` at a model that ships `tokenizer.json`.
 
