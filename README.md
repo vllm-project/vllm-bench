@@ -503,7 +503,7 @@ Run `vllm-bench --help` for the authoritative list. Grouped reference below.
 | `--random-input-len` | `1024` | Input token length |
 | `--random-output-len` | `128` | Output token length |
 | `--random-prefix-len` | `0` | Shared prefix length |
-| `--random-range-ratio` | `1.0` | Length jitter, range `(0, 1]`. Lengths sampled from `[ratio × target, target]`; `1.0` = fixed length |
+| --random-range-ratio | 0.0 | Length jitter, range [0, 1). Lengths sampled uniformly from [(1-ratio) × target, (1+ratio) × target]; 0.0 = fixed length |
 | `--prompt-token-ids` | `false` | Send prompts as token-ID arrays (skips server-side tokenization, exact counts). Random dataset only |
 | **Random multimodal** | | |
 | `--random-mm-base-items-per-request` | `1` | Base number of multimodal items (images) per request |
