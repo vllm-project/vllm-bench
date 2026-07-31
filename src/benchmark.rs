@@ -723,10 +723,10 @@ pub async fn run_benchmark(config: &BenchConfig) -> Result<serde_json::Value> {
         config.dataset_name,
         DatasetName::Random | DatasetName::PrefixRepetition
     );
-    if verifiable_dataset && has_token_ids && !config.backend.is_pooling() {
+    if verifiable_dataset && has_token_ids && !config.is_pooling {
         println!("Using prompt_token_ids, skipping server-side tokenizer verification.");
     }
-    if verifiable_dataset && !has_token_ids && !config.backend.is_pooling() {
+    if verifiable_dataset && !has_token_ids && !config.is_pooling {
         let cache_key = tokenizer_verify_cache_key(&config.base_url, &model_id);
         if is_tokenizer_verified(&cache_key) {
             println!("Tokenizer verified in previous run (cached), skipping verification.");
@@ -1094,7 +1094,7 @@ pub async fn run_benchmark(config: &BenchConfig) -> Result<serde_json::Value> {
 
     // Calculate metrics — pooling uses a dedicated path matching Python's
     // calculate_metrics_for_embeddings (uses server-reported prompt_len, e2el only).
-    let (mut metrics, actual_output_lens) = if config.backend.is_pooling() {
+    let (mut metrics, actual_output_lens) = if config.is_pooling {
         let m =
             calculate_embedding_metrics(&outputs, benchmark_duration, &config.selected_percentiles);
         (m, Vec::new())
@@ -1130,7 +1130,7 @@ pub async fn run_benchmark(config: &BenchConfig) -> Result<serde_json::Value> {
                 &input_requests,
                 &window,
                 &config.selected_percentiles,
-                config.backend.is_pooling(),
+                config.is_pooling,
             );
             metrics.steady_state = Some(ss);
         }

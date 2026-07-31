@@ -28,9 +28,9 @@ pub fn build_result_json(
     result.insert("date".into(), Value::String(current_dt.to_string()));
     result.insert(
         "endpoint_type".into(),
-        Value::String(config.backend.to_string()),
+        Value::String(config.backend_name.clone()),
     );
-    result.insert("backend".into(), Value::String(config.backend.to_string()));
+    result.insert("backend".into(), Value::String(config.backend_name.clone()));
     result.insert(
         "label".into(),
         config
@@ -88,7 +88,7 @@ pub fn build_result_json(
             .unwrap_or(Value::Null),
     );
 
-    let is_pooling = config.backend.is_pooling();
+    let is_pooling = config.is_pooling;
 
     // Benchmark results
     result.insert("duration".into(), serde_json::json!(benchmark_duration));
@@ -275,7 +275,7 @@ pub fn build_multi_turn_result_json(
     // Setup
     result.insert("date".into(), Value::String(current_dt.to_string()));
     result.insert("mode".into(), Value::String("multi_turn".to_string()));
-    result.insert("backend".into(), Value::String(config.backend.to_string()));
+    result.insert("backend".into(), Value::String(config.backend_name.clone()));
     result.insert(
         "model_id".into(),
         Value::String(config.model.clone().unwrap_or_default()),
@@ -648,7 +648,7 @@ pub fn compute_result_filename(config: &BenchConfig, model_id: &str, current_dt:
     let label = config
         .label
         .as_deref()
-        .unwrap_or_else(|| config.backend.as_str());
+        .unwrap_or(config.backend_name.as_str());
 
     let file_name = if config.request_rate.is_infinite() {
         format!("{label}-infqps{max_conc_str}-{base_model}-{current_dt}.json")

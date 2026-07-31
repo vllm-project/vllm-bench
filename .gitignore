@@ -1,3 +1,4 @@
 target/
 bench-overhead/results/
 tmp/
+examples/.demo-venv/

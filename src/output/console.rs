@@ -15,7 +15,7 @@ pub fn print_results(
     has_tokenizer: bool,
     spec_decode_stats: Option<&SpecDecodeStats>,
 ) {
-    let is_pooling = config.backend.is_pooling();
+    let is_pooling = config.is_pooling;
 
     if is_pooling {
         println!("{:=^60}", " Embedding/Pooling Benchmark Result ");
