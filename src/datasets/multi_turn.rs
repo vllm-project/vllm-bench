@@ -32,6 +32,15 @@ pub struct MultiTurnRandomConfig {
     pub seed: u64,
     pub request_id_prefix: String,
     pub prefix_sharing_config: Option<PrefixSharingConfig>,
+    /// Range ratio for sampling per-turn input lengths (Python semantics:
+    /// lengths drawn uniformly from `[len*(1-r), len*(1+r)]`). Default fixed (0.0).
+    pub range_ratio: crate::config::RangeRatio,
+    /// Bimodal prefix-cache: fraction of conversations that are "warm" and reuse a
+    /// shared cached base prefix on turn 0. 0.0 = off. See [`generate_multi_turn_random`].
+    pub cache_hit_fraction: f64,
+    /// Bimodal prefix-cache: fraction of a warm conversation's turn-0 length that is
+    /// the shared cached prefix. Used with `cache_hit_fraction`.
+    pub cache_ratio: f64,
 }
 
 /// Configuration for 3-tier prefix sharing in multi-turn user messages.
@@ -105,8 +114,53 @@ pub fn generate_multi_turn_random(
             &mut rng,
         );
     }
-    let shared_prefix_text =
-        generate_shared_prefix_text(tokenizer, &allowed_tokens, prefix_len, seed)?;
+    // Bimodal prefix-cache mode (mirrors single-turn RandomDataset): a fraction of
+    // whole CONVERSATIONS are "warm" and their turn-0 message begins with a shared
+    // cached base prefix covering `cache_ratio` of turn 0's length; the rest are
+    // "cold" (fully unique). Because every warm conversation's cached slice is a
+    // leading slice of the SAME base, they hit each other's server-side prefix
+    // cache, and — living in turn 0 — the cached prefix keeps paying off every
+    // later turn via history accumulation. When bimodal is on, --random-prefix-len
+    // is ignored (the cached base IS the shared prefix), matching single-turn.
+    let bimodal = cfg.cache_hit_fraction > 0.0 && cfg.cache_ratio > 0.0;
+    if bimodal && (cfg.cache_hit_fraction > 1.0 || cfg.cache_ratio > 1.0) {
+        return Err(BenchError::Config(
+            "--random-cache-hit-fraction and --random-cache-ratio must be in [0, 1]".into(),
+        ));
+    }
+
+    let use_range = !cfg.range_ratio.is_fixed();
+    let (in_low, in_high) = cfg.range_ratio.input_bounds(real_input_len);
+    let (pt_low, pt_high) = cfg.range_ratio.input_bounds(real_per_turn_len);
+
+    // Shared cached base prefix (bimodal only). Built once from turn 0's UPPER bound
+    // so any warm conversation's cached slice fits. Uses an independent RNG so the
+    // main sampling sequence (and thus non-bimodal output) is unchanged.
+    let base_len = if bimodal {
+        ((in_high as f64) * cfg.cache_ratio).ceil() as usize
+    } else {
+        0
+    };
+    let base_tokens: Vec<u32> = if base_len > 0 {
+        let mut br = StdRng::seed_from_u64(seed.wrapping_add(0xCACE));
+        let seq: Vec<u32> = (0..base_len)
+            .map(|_| allowed_tokens[br.gen_range(0..allowed_tokens.len())])
+            .collect();
+        // Round-trip through the tokenizer so decode(base_tokens[..c]) is a stable
+        // byte-prefix (same assumption the 3-tier prefix-sharing path relies on).
+        let (_text, toks) = gen_prompt_to_target_len(tokenizer, &seq, base_len)?;
+        toks
+    } else {
+        Vec::new()
+    };
+    let base_avail = base_tokens.len();
+
+    // Non-bimodal keeps its original shared prefix from --random-prefix-len.
+    let shared_prefix_text = if bimodal {
+        Arc::from("")
+    } else {
+        generate_shared_prefix_text(tokenizer, &allowed_tokens, prefix_len, seed)?
+    };
 
     // Pre-generate per-conversation turn counts and per-turn offsets deterministically.
     // Turn counts are drawn first so the RNG sequence is stable regardless of vocab_size.
@@ -125,6 +179,44 @@ pub fn generate_multi_turn_random(
         .map(|&n| (0..n).map(|_| rng.gen_range(0..vocab_size)).collect())
         .collect();
 
+    // Per-conversation warm/cold flags (bimodal only), drawn from an independent RNG
+    // to keep the main sequence pristine.
+    let conv_warm: Vec<bool> = if bimodal {
+        let mut wr = StdRng::seed_from_u64(seed.wrapping_add(0xF00D));
+        (0..num_conversations)
+            .map(|_| wr.gen::<f64>() < cfg.cache_hit_fraction)
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // Per-(conversation, turn) sampled input lengths (range-ratio only). Independent
+    // RNG so the fixed default case consumes no extra randomness and stays identical.
+    let turn_lens: Vec<Vec<usize>> = if use_range {
+        let mut lr = StdRng::seed_from_u64(seed.wrapping_add(0xBEEF));
+        conv_turn_counts
+            .iter()
+            .map(|&n| {
+                (0..n)
+                    .map(|t| {
+                        let (lo, hi) = if t == 0 {
+                            (in_low, in_high)
+                        } else {
+                            (pt_low, pt_high)
+                        };
+                        if lo >= hi {
+                            lo
+                        } else {
+                            lr.gen_range(lo..=hi)
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     // Parallel generation across conversations
     offsets
         .par_iter()
@@ -132,30 +224,58 @@ pub fn generate_multi_turn_random(
         .map(|(conv_idx, conv_offsets)| {
             let mut turns = Vec::with_capacity(conv_offsets.len());
             for (turn_idx, &offset) in conv_offsets.iter().enumerate() {
-                let target_len = if turn_idx == 0 {
+                let target_len = if use_range {
+                    turn_lens[conv_idx][turn_idx]
+                } else if turn_idx == 0 {
                     real_input_len
                 } else {
                     real_per_turn_len
                 };
-                // Use max_turns stride to keep offsets unique across variable-length convs
-                let inner_seq = make_token_seq(
-                    &allowed_tokens,
-                    offset + conv_idx * max_turns + turn_idx,
-                    target_len,
-                );
 
-                let (prompt, adjusted) =
-                    gen_prompt_to_target_len(tokenizer, &inner_seq, target_len)?;
-                let (prompt, token_len) = if turn_idx == 0 && !shared_prefix_text.is_empty() {
-                    let combined = format!("{}{}", &*shared_prefix_text, prompt);
+                // Bimodal: warm conversations get a shared cached prefix on turn 0 that
+                // counts toward target_len (cached + unique = target_len), so the unique
+                // suffix shrinks accordingly.
+                let cached = if bimodal && turn_idx == 0 && conv_warm[conv_idx] {
+                    (((target_len as f64) * cfg.cache_ratio).round() as usize)
+                        .min(base_avail)
+                        .min(target_len)
+                } else {
+                    0
+                };
+                let suffix_len = target_len - cached;
+
+                // Unique suffix tokens. Use max_turns stride to keep offsets unique
+                // across variable-length conversations.
+                let (suffix_text, suffix_tokens_len) = if suffix_len > 0 {
+                    let inner_seq = make_token_seq(
+                        &allowed_tokens,
+                        offset + conv_idx * max_turns + turn_idx,
+                        suffix_len,
+                    );
+                    let (text, toks) =
+                        gen_prompt_to_target_len(tokenizer, &inner_seq, suffix_len)?;
+                    (text, toks.len())
+                } else {
+                    (String::new(), 0)
+                };
+
+                let (user_message, token_len) = if cached > 0 {
+                    // decode(base_tokens[..cached]) is a byte-prefix of the full base
+                    // text, so all warm conversations share the same leading tokens.
+                    let cached_text = tokenizer.decode(&base_tokens[..cached], true)?;
+                    let combined = format!("{cached_text}{suffix_text}");
+                    let token_len = tokenizer.encode(&combined, false)?.len();
+                    (combined, token_len)
+                } else if turn_idx == 0 && !shared_prefix_text.is_empty() {
+                    let combined = format!("{}{}", &*shared_prefix_text, suffix_text);
                     let token_len = tokenizer.encode(&combined, false)?.len();
                     (combined, token_len)
                 } else {
-                    (prompt, adjusted.len())
+                    (suffix_text, suffix_tokens_len)
                 };
 
                 turns.push(ConversationTurn {
-                    user_message: Arc::from(prompt),
+                    user_message: Arc::from(user_message),
                     user_message_len: token_len,
                     expected_output_len: output_len,
                 });
@@ -545,6 +665,12 @@ mod tests {
             output_len: 100,
             seed: 42,
             request_id_prefix: "test-".to_string(),
+            range_ratio: crate::config::RangeRatio {
+                input: 0.0,
+                output: 0.0,
+            },
+            cache_hit_fraction: 0.0,
+            cache_ratio: 0.0,
             prefix_sharing_config: Some(PrefixSharingConfig {
                 global_ratio: 0.1,
                 conversation_ratio: 0.8,
@@ -630,6 +756,12 @@ mod tests {
             output_len: 64,
             seed: 1,
             request_id_prefix: "test-".to_string(),
+            range_ratio: crate::config::RangeRatio {
+                input: 0.0,
+                output: 0.0,
+            },
+            cache_hit_fraction: 0.0,
+            cache_ratio: 0.0,
             prefix_sharing_config: None,
         };
 
@@ -670,6 +802,12 @@ mod tests {
             output_len: 32,
             seed: 7,
             request_id_prefix: "test-".to_string(),
+            range_ratio: crate::config::RangeRatio {
+                input: 0.0,
+                output: 0.0,
+            },
+            cache_hit_fraction: 0.0,
+            cache_ratio: 0.0,
             prefix_sharing_config: None,
         };
 
@@ -704,6 +842,12 @@ mod tests {
             output_len: 32,
             seed: 42,
             request_id_prefix: "test-".to_string(),
+            range_ratio: crate::config::RangeRatio {
+                input: 0.0,
+                output: 0.0,
+            },
+            cache_hit_fraction: 0.0,
+            cache_ratio: 0.0,
             prefix_sharing_config: None,
         };
 
@@ -733,6 +877,12 @@ mod tests {
             output_len: 64,
             seed: 3,
             request_id_prefix: "test-".to_string(),
+            range_ratio: crate::config::RangeRatio {
+                input: 0.0,
+                output: 0.0,
+            },
+            cache_hit_fraction: 0.0,
+            cache_ratio: 0.0,
             prefix_sharing_config: Some(PrefixSharingConfig {
                 global_ratio: 0.05,
                 conversation_ratio: 0.50,
@@ -778,5 +928,127 @@ mod tests {
             }
         }
         println!("per_turn_input_len prefix-sharing checks passed!");
+    }
+
+    #[test]
+    #[ignore]
+    fn test_bimodal_prefix_cache_multi_turn() {
+        let tok = crate::tokenizer::load_tokenizer("nvidia/Kimi-K2.5-NVFP4", false, None).unwrap();
+
+        // 80% warm, 95% cached. Many conversations so the warm fraction is observable.
+        let cfg = MultiTurnRandomConfig {
+            num_conversations: 200,
+            min_turns: 2,
+            max_turns: 2,
+            prefix_len: 0,
+            input_len: 1000,
+            per_turn_input_len: 200,
+            output_len: 64,
+            seed: 7,
+            request_id_prefix: "test-".to_string(),
+            range_ratio: crate::config::RangeRatio {
+                input: 0.0,
+                output: 0.0,
+            },
+            cache_hit_fraction: 0.8,
+            cache_ratio: 0.95,
+            prefix_sharing_config: None,
+        };
+
+        let conversations = generate_multi_turn_random(&tok, &cfg).unwrap();
+        assert_eq!(conversations.len(), 200);
+
+        // A conversation is "warm" if its turn-0 message begins with the shared cached
+        // base prefix. All warm turn-0 messages must share a large common byte prefix
+        // (~95% of 1000 tokens); cold ones do not.
+        let turn0: Vec<&str> = conversations
+            .iter()
+            .map(|c| &*c.turns[0].user_message)
+            .collect();
+
+        // Group by whether each shares a long prefix with the most common leading run.
+        // Use the observed max pairwise prefix as the warm signal: warm vs warm share
+        // hundreds of bytes, warm vs cold share ~0.
+        let mut warm_count = 0usize;
+        for (i, &a) in turn0.iter().enumerate() {
+            // count how many OTHER turn-0 messages share a big prefix with this one
+            let shared_big = turn0
+                .iter()
+                .enumerate()
+                .filter(|(j, &b)| *j != i && common_prefix_bytes(&[a, b]) > 100)
+                .count();
+            if shared_big > 0 {
+                warm_count += 1;
+            }
+        }
+        let warm_frac = warm_count as f64 / turn0.len() as f64;
+        println!("Observed warm fraction: {warm_frac:.3} (target 0.8)");
+        assert!(
+            (0.65..=0.95).contains(&warm_frac),
+            "warm fraction {warm_frac} not near cache_hit_fraction 0.8"
+        );
+
+        // All warm conversations must share a common leading run (they slice the same
+        // base). Collect warm turn-0 messages and check their common prefix is large.
+        let warm_msgs: Vec<&str> = turn0
+            .iter()
+            .copied()
+            .filter(|&a| {
+                turn0
+                    .iter()
+                    .any(|&b| !std::ptr::eq(a, b) && common_prefix_bytes(&[a, b]) > 100)
+            })
+            .collect();
+        let warm_common = common_prefix_bytes(&warm_msgs);
+        println!("Warm-set common prefix: {warm_common} bytes");
+        assert!(
+            warm_common > 100,
+            "warm conversations must share a large cached prefix, got {warm_common} bytes"
+        );
+
+        // Turn 0 length ≈ 1000 for every conversation (warm cached + suffix = 1000).
+        for conv in &conversations {
+            let diff = (conv.turns[0].user_message_len as i64 - 1000).abs();
+            assert!(diff <= 15, "turn-0 len {} far from 1000", conv.turns[0].user_message_len);
+        }
+        println!("bimodal multi-turn prefix-cache checks passed!");
+    }
+
+    #[test]
+    #[ignore]
+    fn test_range_ratio_varies_lengths_multi_turn() {
+        let tok = crate::tokenizer::load_tokenizer("nvidia/Kimi-K2.5-NVFP4", false, None).unwrap();
+
+        let cfg = MultiTurnRandomConfig {
+            num_conversations: 40,
+            min_turns: 2,
+            max_turns: 2,
+            prefix_len: 0,
+            input_len: 1000,
+            per_turn_input_len: 0,
+            output_len: 64,
+            seed: 11,
+            request_id_prefix: "test-".to_string(),
+            range_ratio: crate::config::RangeRatio {
+                input: 0.5,
+                output: 0.0,
+            },
+            cache_hit_fraction: 0.0,
+            cache_ratio: 0.0,
+            prefix_sharing_config: None,
+        };
+
+        let conversations = generate_multi_turn_random(&tok, &cfg).unwrap();
+        let turn0_lens: Vec<usize> = conversations
+            .iter()
+            .map(|c| c.turns[0].user_message_len)
+            .collect();
+
+        let min = *turn0_lens.iter().min().unwrap();
+        let max = *turn0_lens.iter().max().unwrap();
+        println!("range-ratio 0.5 turn-0 lengths: min={min}, max={max}");
+        // Expect a spread within [~500, ~1500] and clearly non-constant.
+        assert!(max - min > 100, "range_ratio 0.5 should vary lengths, spread was {}", max - min);
+        assert!(min >= 400 && max <= 1600, "lengths {min}..{max} out of expected band");
     }
 }

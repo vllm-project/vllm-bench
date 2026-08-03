@@ -604,6 +604,34 @@ impl BenchConfig {
                     "Prefix sharing (--multi-turn-prefix-global-ratio / --multi-turn-prefix-conversation-ratio) only works with --dataset-name random".into(),
                 ));
             }
+
+            // Bimodal prefix-cache (--random-cache-hit-fraction / --random-cache-ratio)
+            // is supported in multi-turn only for the synthetic random dataset, and it
+            // is mutually exclusive with the no-history prefix-sharing mode.
+            let chf = cli.random_cache_hit_fraction;
+            let cr = cli.random_cache_ratio;
+            if chf > 0.0 || cr > 0.0 {
+                if cli.dataset_name != DatasetName::Random {
+                    return Err(BenchError::Config(
+                        "Bimodal prefix-cache (--random-cache-hit-fraction / --random-cache-ratio) with --multi-turn only works with --dataset-name random".into(),
+                    ));
+                }
+                if pg > 0.0 || pc > 0.0 {
+                    return Err(BenchError::Config(
+                        "--random-cache-hit-fraction / --random-cache-ratio cannot be combined with --multi-turn-prefix-global-ratio / --multi-turn-prefix-conversation-ratio (both define the shared prefix)".into(),
+                    ));
+                }
+                if !(chf > 0.0 && cr > 0.0) {
+                    return Err(BenchError::Config(
+                        "Bimodal prefix-cache requires BOTH --random-cache-hit-fraction and --random-cache-ratio to be > 0".into(),
+                    ));
+                }
+                if chf > 1.0 || cr > 1.0 {
+                    return Err(BenchError::Config(
+                        "--random-cache-hit-fraction and --random-cache-ratio must be in [0, 1]".into(),
+                    ));
+                }
+            }
         }
 
         if !(cli.steady_state_threshold > 0.0 && cli.steady_state_threshold <= 1.0) {
