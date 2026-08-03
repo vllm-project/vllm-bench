@@ -1,5 +1,23 @@
 # vllm-bench
 
+> [!IMPORTANT]
+> **This project has moved into the main vLLM repository. This repository is archived and read-only.**
+>
+> `vllm-bench` is now developed and maintained upstream as a crate in the vLLM Rust workspace:
+> **[vllm-project/vllm → `rust/src/bench`](https://github.com/vllm-project/vllm/tree/main/rust/src/bench)**.
+>
+> Please file issues and open pull requests in [vllm-project/vllm](https://github.com/vllm-project/vllm) — this repository no longer accepts them. It is kept only for the original commit history predating the move.
+>
+> Build from the new home:
+>
+> ```bash
+> git clone https://github.com/vllm-project/vllm.git
+> cd vllm/rust
+> cargo build --release -p vllm-bench   # -> target/release/vllm-bench
+> ```
+>
+> The documentation below describes the final standalone version and is no longer updated; see the upstream [`rust/src/bench/README.md`](https://github.com/vllm-project/vllm/blob/main/rust/src/bench/README.md) for current docs.
+
 High-performance Rust benchmark client for vLLM serving endpoints. A drop-in replacement for `vllm bench serve` with near-instant startup, parallel dataset generation, and a fraction of the memory overhead — and no Python at runtime.
 
 ```bash
@@ -43,6 +61,9 @@ vllm-bench --backend vllm --base-url http://127.0.0.1:8000 \
 - [Environment Variables](#environment-variables)
 
 ## Install
+
+> [!NOTE]
+> The instructions in this section target the archived standalone repository. Existing release binaries and `cargo install --git` still work, but they are frozen at the last standalone commit and receive no further fixes. For the maintained version, build `vllm-bench` from [vllm-project/vllm](https://github.com/vllm-project/vllm) as shown at the top of this file.
 
 ### Prebuilt binaries (Linux)
 
